@@ -134,8 +134,8 @@ I would suggest you start with analysing data from the Ahrefs data, then move on
 
 **3 relevant files**
 
-*1. raw file can be downlaoded here and should be named ahrefs_raw.csv and placed under raw_data; Size 1,5gb*
-https://drive.google.com/file/d/1WCa5aXmMOdamU6Bs4ObU0CsNg57u5X51/view
+*1. raw Ahrefs data  should be named ahrefs_raw.csv and placed under raw_data; Size 1,5gb*
+
 
 ```{r data}
 ## clean data:
