@@ -1,0 +1,148 @@
+---
+title: "Data Prep"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+required_packages <- c("tidyverse", "readxl", "ggthemes", "hrbrthemes", "extrafont", "plotly", "scales", "stringr", "gganimate", "here", "tidytext", "sentimentr", "scales", "DT", "here", "sm", "mblm", "prettydoc", "reshape2", "treemapify", "glue", "magick", "imager", "fs", "knitr", "DataExplorer", "inspectdf", "rmdformats", "prettydoc", "janitor")
+
+for(i in required_packages) { 
+if(!require(i, character.only = T)) {
+#  if package is not existing, install then load the package
+install.packages(i, dependencies = T)
+require(i, character.only = T)
+}
+}
+```
+
+
+```{r}
+df_ahrefs <-  read_tsv(here("raw_data/ahrefs_raw.csv")) %>% 
+  clean_names() 
+
+
+```
+
+# Test scrape with 10k
+
+```{r}
+names(df_ahrefs)
+summary(df_ahrefs)
+str(df_ahrefs)
+
+df_10k <- df_ahrefs %>% 
+  filter(domain_rating >= 30, domain_rating <= 90, percent_partial_matches >= 0.1) %>% 
+  arrange(domain_rating) %>% 
+  head(10000) 
+
+df_10k_sample <- df_ahrefs %>% 
+  arrange(domain_rating) %>% 
+  sample_n(10000) %>% 
+  as_tibble()
+
+write_csv(df_10k, "raw_data/data_sample10k.csv")
+write_csv(df_10k_sample, "raw_data/data_sample10k_sample.csv")
+
+
+
+```
+
+```{r}
+install.packages("urltools")
+
+library(urltools)
+
+df_10k <- df_10k %>%
+  mutate(domain_name = suffix_extract(uls))
+  
+
+```
+
+```{r}
+##subset
+df_subset_10000 <- df_ahrefs %>% 
+  filter(domain_rating >= 30, domain_rating <= 90, percent_partial_matches >= 0.1) %>%   arrange(domain_rating) %>% 
+  head(10000)
+
+write_csv(df_subset_10000, "raw_data/df_subset_1000.csv")
+```
+
+```{r}
+#all urls; only unique
+
+df_urls_to_scrape <- df_ahrefs %>% 
+  distinct(url)
+
+write_csv(df_urls_to_scrape, "raw_data/df_urls_to_scrape.csv")
+
+```
+
+
+```{r}
+#clearscope
+
+#select 10000 random keywords and keep their rows
+sample_n_groups = function(grouped_df, size, replace = FALSE, weight=NULL) {
+  grp_var <- grouped_df %>% 
+    groups %>%
+    unlist %>% 
+    as.character
+  random_grp <- grouped_df %>% 
+    summarise() %>% 
+    sample_n(size, replace, weight) %>% 
+    mutate(unique_id = 1:NROW(.))
+  grouped_df %>% 
+    right_join(random_grp, by=grp_var) %>% 
+    group_by_(grp_var) 
+}
+
+
+df_ahrefs_clearscope <- df_ahrefs %>% group_by(keyword) %>% sample_n_groups(10000)
+
+df_ahrefs_clearscope <- df_ahrefs_clearscope %>% 
+  select(keyword, url, position) %>% 
+  mutate(content_grade = NA) %>% 
+  group_by(position) %>% 
+  arrange(keyword)
+
+write_csv(df_ahrefs_clearscope, "raw_data/df_clearscope_content_grade.csv")
+
+
+  
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+#load scraped data
+
+#Import data from GKP_DE_CLEAN
+file_names_csv <- list.files(path = here("raw_data/data_scrape_raw/"), recursive = TRUE, full.names = T) 
+
+
+file <- map(file_names_csv, data.table::fread()) 
+
+names(file) <- gsub(".csv","",
+                       list.files(here("raw_data/data_scrape_raw/"), full.names = FALSE),
+                       fixed = TRUE)
+
+
+df_scrape <- bind_rows(file, .id = "column_name") %>% 
+  clean_names() 
+
+
+
+
+
+
+```
+

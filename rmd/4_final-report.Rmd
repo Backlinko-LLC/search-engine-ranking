@@ -1,0 +1,1042 @@
+---
+title: "We Analyzed 11.8 Million Google Search Results. Here’s What We Learned About SEO [UPDATE]"
+author: "Cédric Scherer & Daniel Kupka (FrontPage Data) & Brian Dean (backlinko.com)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: paper
+    highlight: kate
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+knitr::knit_hooks$set(inline = function(x) {
+  prettyNum(x, big.mark = ",", small.mark = ",", scientific = F)
+})
+```
+
+```{r prep}
+## packages
+library(tidyverse)
+library(kableExtra)
+```
+
+
+# 1 Introduction
+
+With Google evaluating sites based on various ranking factors, knowing on which ranking factors to focus on your SEO strategy for the biggest bang is crucial.
+
+Several large-scale data studies, mainly conducted by SEO vendors, have sought to
+uncover the relevance and importance of certain ranking factors*. However, in our view, the
+studies contain major statistical flaws. For example, the use of correlation statistics as the main instrument may render results that are misleading in the presence of outliers or non-linear associations.
+
+Considering the methodological issues and the lack of certain ranking factors, there is a need for rock solid data formatted into clear takeaways.
+
+
+## 1.1 Methodology 
+
+```{r data-ahrefs}
+## import raw data
+rds_raw <- here::here("proc_data", "ahrefs_raw.Rds")
+
+if(!file.exists(rds_raw)){
+  df_ahrefs_raw <- data.table::fread(here::here("raw_data", "ahrefs_raw.csv"))
+  saveRDS(df_ahrefs_raw, rds_raw)
+}else{
+  df_ahrefs_raw <- readRDS(rds_raw)
+}
+
+## number of unique keywords
+# n_distinct(df_ahrefs_raw$keyword)
+
+## number of unique urls
+# n_distinct(df_ahrefs_raw$url)
+
+## check # positions per keyword
+rds_n <- here::here("proc_data", "ahrefs_n.Rds")
+
+if(!file.exists(rds_n)){
+  
+  df_ahrefs_n <-
+    df_ahrefs_raw %>% 
+    group_by(keyword) %>% 
+    count()
+  
+  saveRDS(df_ahrefs_n, rds_n)
+}else{
+  df_ahrefs_n <- readRDS(rds_n)
+}
+
+# df_ahrefs_n %>% 
+#   filter(n < 10) %>% 
+#  arrange(n)
+
+removed_keywords <- nrow(filter(df_ahrefs_n, n < 5))
+
+## cleaned: 
+##   - remove NA columns
+##   - only keywords with 5 samples (positions) or more
+##   - assign large domains
+
+large_doms <- c("youtube.com", "amazon.com", "facebook.com", "en.wikipedia.org", 
+                "pinterest.com", "yelp.com", "tripadvisor.com", "ebay.com", 
+                "reddit.com", "linkedin.com", "twitter.com", "imdb.com", 
+                "walmart.com", "yellowpages.com", "mapquest.com", "etsy.com", 
+                "quora.com", "instagram.com", "target.com")
+
+rds_proc <- here::here("proc_data", "ahrefs_proc.Rds")
+
+if(!file.exists(rds_proc)){
+  
+  df_ahrefs <-
+    df_ahrefs_raw %>% 
+    dplyr::select(-exact_matches, -partial_matches, -anchors) %>% 
+    rename(
+      perc_exact_matches = `% exact_matches`,
+      perc_partial_matches = `% partial_matches`,
+    ) %>% 
+    group_by(keyword) %>% 
+    filter(n() >= 5) %>% 
+    ungroup() %>% 
+    mutate(
+      large_domains = case_when(
+        str_detect(url, large_doms[1]) ~ !!large_doms[1],
+        str_detect(url, large_doms[2]) ~ !!large_doms[2],
+        str_detect(url, large_doms[3]) ~ !!large_doms[3],
+        str_detect(url, large_doms[4]) ~ !!large_doms[4],
+        str_detect(url, large_doms[5]) ~ !!large_doms[5],
+        str_detect(url, large_doms[6]) ~ !!large_doms[6],
+        str_detect(url, large_doms[7]) ~ !!large_doms[7],
+        str_detect(url, large_doms[8]) ~ !!large_doms[8],
+        str_detect(url, large_doms[9]) ~ !!large_doms[9],
+        str_detect(url, large_doms[10]) ~ !!large_doms[10],
+        str_detect(url, large_doms[11]) ~ !!large_doms[11],
+        str_detect(url, large_doms[12]) ~ !!large_doms[12],
+        str_detect(url, large_doms[13]) ~ !!large_doms[13],
+        str_detect(url, large_doms[14]) ~ !!large_doms[14],
+        str_detect(url, large_doms[15]) ~ !!large_doms[15],
+        str_detect(url, large_doms[16]) ~ !!large_doms[16],
+        str_detect(url, large_doms[17]) ~ !!large_doms[17],
+        str_detect(url, large_doms[18]) ~ !!large_doms[18],
+        str_detect(url, large_doms[19]) ~ !!large_doms[19],
+        TRUE ~ "other"
+      ),
+      is_large = if_else(large_domains == "other", "Other Domains", "Large Domains"),
+      url_length = nchar(url)
+    )
+  
+  saveRDS(df_ahrefs, rds_proc)
+}else{
+  df_ahrefs <-readRDS(rds_proc)
+}
+
+## count non-NAs per variable
+df_not_na <-
+  df_ahrefs %>% 
+  dplyr::select(position, Domain_rating:perc_partial_matches, url_length) %>% 
+  summarise_at(vars(Domain_rating:perc_partial_matches, url_length), 
+               list(~ sum(!is.na(.))))
+
+## count values per large domain
+df_large_n <-
+  df_ahrefs %>%
+  group_by(large_domains) %>% 
+  count()
+
+rm(rds_raw, rds_n, rds_proc)
+```
+
+- **Step 1 Ahrefs Raw Data**: As a data partner, Ahrefs provided the raw data for the analysis. The data contained  **`r format(n_distinct(df_ahrefs_raw$keyword), big.mark = ",")`** keywords (`r format(n_distinct(df_ahrefs$keyword), big.mark = ",")` after data cleaning, for details see below) with a total number of **`r format(nrow(df_ahrefs_raw), big.mark = ",")`** ranking (**`r format(n_distinct(df_ahrefs_raw$url), big.mark = ",")`**  unique URL's; **`r format(n_distinct(df_ahrefs$url), big.mark = ",")`** after data cleaning).  
+
+- **Step 3 Data Mining**: We developed a data-mining script to gather data on various variables. More specificially, we collected data on Schema.org Usage, Word Count, Title, H1, Broken Links and Page Size (HTML). Due to anti-mining mechanisms, authoritative domains such as Amazon.com or youtube.com were not considered (see Section 1.2 for the number of observations we excluded for each domain). In the forthcoming sections, we refer to those as "Large Domains". No data could be extracted for roughly 6% of the URLs due to server response errors. In total, we mined data from about **7,633,169** URLs.
+
+- **Step 4 APIs and external data sources**: In addition, the Alexa API was used to collect domain level data on the Time-on-Site and Page Speed variables. Furthermore, Clearscope.io, another data partner, collected "content scores" on 1000 high-search volume keywords (see Section 2.3.3 for a detailed explanation) 
+
+- **Step 4 Data Analysis**: The data has been analysed and processed for selected features to showcase whether they have a positive or negative trend on Google Ranking Positions. Polynomial regression has been applied to all numeric variables. In some cases, linear regression has been used (e.g. URL length) to provide simple average trends.
+
+**A note on chart types:**  
+
+We are using three types of charts to represent the data and the trends among positions that may be considered as "non-traditional" charts. Here some notes how to read them and why we think they are helpful.
+
+1. **Multiple probability intervals ("distribution stripes"):** 
+   - The plot shows in a simple way how the data is distributed and allows to compare easily the distributions within and among position.
+   - For each position, several bars of different color are drawn that contain X% of the values, starting at the median (somewhere in the 5% area)
+   - The dark(er) stripes are basically a visual fitting and allows us to determine if there is any change in the metric with position or between large domains and other.
+   - In some cases, only one or two bars are contained in the plot - this is due to the fact that lower percentages of the data do fall in very limited range of the metric, thus being invisible for our eyes.
+   - **Possible adjustments:** Of course, we can change the number of levels (currently 6 for the data exploration and to give you the chance to choose) and their thresholds. So if you, for example, think 6 are too many and no one is interested where 25% or 75% of the data are - fine, than we create these plots with 4 levels: 5%, 50%, 95%, 100%.
+   
+2. **Point intervals with polynomial or linear fitting:**
+   - The plot shows, a bit similar to the distribution stripes, where the majority of data sits. 
+   - The dot reperesents the median value, the thick line 50% of the data and the thin line 95% of the data.
+   - In some cases, only a dot can be seen - this is beacuse more than 95% of the data are equal or close to the median (and thus the lines lay behind the dot). Due to some outliers, the fitting might look a bit off (but have a closer look on the axes ranges of median and maximum - often the trend is neglectible anyway.)
+   - **Possible adjustments:** Similar to the chart type above, we can change the interval ranges (now 50% and 95%) to any you like and also reduce or increase their number. 
+
+3. **Diverging range plot:**
+   - Due to the complexity of the data (domain, metric and change in position), we have tried a new plot type that shows the median value of the metric (black dot) and the range from minimum to maximum (segments). 
+   - The colors indicate if the values above and below the average, respectively, belong to a lower or higher average position.
+   - This plot shows in a simple way which large domains have considerably higher/lower medians and/or ranges plus if an increase or decrease in that metric is correlated with an increase of average position (all or most segments right from the dots are backlino-cyan) or with an decrease (all or most segements right from the dots are purple).
+   - (Detailed methods: For each domain, we calculated the mean. For each URL we assigned if the scored lower or higher than the average. Afterwards we've compared these means of position and colored the segments according. Example: a mean of 5, mostly URL's on low positions score low and those on high positions high. Thus, the mean position of URL's above the mean will be greater than the mean of URL's below the median.)
+   - **Possible adjustments:** Again, the length of the segments could be adjusted to represent 50%, 95% or 37.6278% of the data.
+
+**A note on the fittings (visualised in the point-range plots):** 
+- Compared to simple linear regression, polynomial fittings are a great way to capture more complex patterns in the data. However, it makes it more difficult to put hard numbers on them (since it's not lineary scaled as 1% more -> 1 position more). - In case the polynomial fiting was close to the outcome of a simple linear regression, we used a linear regression instead to reduce complexity and provide simple, linearly scaled lifting numbers. 
+- In some cases, the fitting does not have much explanatory power, so we decided to not include models in all cases and/or state this prominently (referring to a low R^2 for example). 
+- Please keep in mind that several of the fittings can be misleading and/or are not or only vaguely supported. Often, the trends are driven by some URL's that have very extreme values compared to the majority (95% or even more of the data). However, correlation does not mean causality so the reason is likely not the metric driven the pattern but other factors leading to some URL's with extreme values scoring best (see for example backlinks and referring domains). 
+- **Possible adjustments:** 
+  + In any case, it is possible to exclude such outliers and calculate the linear fitting/lifting numbers for, let's say, the top 95% of the data of each position.
+  + Depending on the time left, another option would be generalized linear (mixed) effect models. With this advanced type of regression model, we would likely be able to fit a range of explanatory variables/metrics to see how they affect the response variable "position". This way, we could directly determine the (relative) effect on the response variable and dig a bit deeper than investigating the effect/trend correlation of each variable on it's own. Possbile drawbacks could be here (i) the sheer amount of data which may cause problems when fitting the model; (ii) the correlation between explanatory variables that leads to exclusion of some variables (otherwise, effects would be "masked") - examples here would be here backlings and referring domains, exact and partial anchor matches and likely some more; (iii) potential problems with the prerequisites needed for the model which could lead to an iteration of model runs and adjustments to find the best data transformation for each variable.
+
+
+## 1.2 Cleaning the Data: What Information Do We Keep for Analysis? 
+
+### Ahrefs Data
+
+* In some keywords there are less than 10 ranking URL's &rarr; We removed `r removed_keywords` keywords that contained less than 5 positions.
+
+* Metrics provided:
+
+  - domain rating (`Domain_rating`) &rarr; `r format(df_not_na$Domain_rating, big.mark = ",")` values
+  
+  - URL rating (`URL_rating`) &rarr; `r format(df_not_na$URL_rating, big.mark = ",")` values
+  
+  - number of backlinks (`backlinks`) &rarr; `r format(df_not_na$backlinks, big.mark = ",")` values
+
+  - number of referring domains (`refdomains`) &rarr; `r format(df_not_na$refdomains, big.mark = ",")` values
+  
+  - exact match (`perc_exact_matches`) &rarr; `r format(df_not_na$perc_exact_matches, big.mark = ",")` values
+
+  - partial match (`perc_partial_matches`) &rarr; `r format(df_not_na$perc_partial_matches, big.mark = ",")` values
+  
+  - URL length (`perc_partial_matches`) &rarr; `r format(df_not_na$url_length, big.mark = ",")` values
+
+
+* Some metrics contain NA values:
+
+  - Domain rating: `r nrow(df_ahrefs %>% filter(is.na(Domain_rating)))` missing values
+  
+  - URL rating: `r nrow(df_ahrefs %>% filter(is.na(URL_rating)))` missing values number of backlinks: `r nrow(df_ahrefs %>% filter(is.na(backlinks)))` missing values
+  
+  - Number of referring domains: `r nrow(df_ahrefs %>% filter(is.na(refdomains)))` missing values
+  
+![](../plots/1_2_summary_na.png)
+
+
+We have also a lot of large domains that we did not scrape and we also compare the trends for both large domains and all other URL's.
+The following domains were classified as *large domains*:
+
+```{r table-large-domains}
+df_large_n %>%
+  ungroup() %>% 
+  filter(large_domains != "other") %>% 
+  dplyr::select(
+    "Domain" = large_domains,
+    "Count" = n
+  ) %>% 
+  arrange(-Count) %>% 
+  kable(format.args = list(big.mark = ",", 
+                           small.mark = ",", 
+                           decimal.mark = ".", 
+                           scientific = F)) %>%
+  kable_styling(fixed_thead = T) %>%
+  scroll_box(width = "30%", height = "500px")
+```
+<br>
+`r format(df_large_n %>% filter(large_domains == "other") %>% pull(n), big.mark = ",")` URL's were classified as *other domains*.
+
+![](../plots/1_2_summary_largedomains.png)
+
+
+```{r, include = F}
+rm(df_ahrefs_raw, df_ahrefs_n, df_not_na, df_large_n)
+```
+
+
+# 2 Research Findings
+
+In this section, we analyse how different ranking factors relate with higher organic positions in the Search Engine Results Pages (SERPs).
+
+More specifiically, we look at following factors:
+
+* Backlink Factors 
+* Domain Factors
+* Page-level Factors
+
+
+## 2.1 Backlink Factors
+
+
+### 2.1.1 Backlinks
+
+![](../plots/2_1_1_histogram_backlinks.png)
+(**Note:** Logarithmic scale (log10) on the x axis.)
+
+<br>
+
+![](../plots/2_1_1_histogram_backlinks_loglog.png)
+(**Note:** Logarithmic scale on both the x and y axis.)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* The majority of URL's contain no backlinks at all (more than 95% of all URL's).
+
+* This pattern is independent form position (see additional plots below).
+
+* Due to the highly skewed data, any trend found has to be treated with caution - a few URL's drive the pattern.
+
+
+![](../plots/2_1_1_pointint_backlinks_0s.png)
+<br>
+![](../plots/2_1_1_multiint_backlinks_0s.png)
+
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* More than 95% of all URL's do not contain any backlinks (only light dots and green bars, respectively, the lines/all other bars sit exactly at 0 and are thus not visible). This pattern is independent from position.
+
+* Also, the maximum range appears to be independent from position since some URL's containing more than 20M backlinks can be found on rank 2, 3, 5, 6 and 9. 
+
+* Given URL's that contain millions of backlinks, the trend does not seem to be relevant. seems to be uninteresting. 
+
+* The fitting accounts also for a few URL's with very high values (not contained in the major 95%), thus it looks a bit off. 
+
+</details>
+<br><br>
+
+
+
+##### Effect of Large Domains
+
+In a next step, we compare domains classified as *large* with all others.
+
+![](../plots/2_1_1_multiint_backlinks_facet_0s.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Large domains contain mostly a low number of backlinks with an distinct peak above 200K on #2 ( a en.wikipedia.org URL)
+
+* Other domains contain also in almost all cases no backlinks, but the ranges are far higher, sometimes exceeding 20M.
+
+<br>
+
+To investigate the patterns in more detail, we split the group of large domains into each domain on it's own. This way we can see that Wikipedia contains many more backlinks than any other large domain and drives the pattern we have seen in the plot before.
+
+![](../plots/2_1_1_segments_backlinks_largedoms_0s.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Wikipedia contains remarkably more backlinks (47.2) on average than any other of the large domains (0.026).
+
+* In almost all cases, more backlinks result in higher average position (most bars pointing to the right are colored backlinko-cyan).
+
+<br><br>
+
+
+#### Excl. URLs without Backlinks
+
+Unfortunately, most URLs do not contain any backlinks at all. In a follow-up step, we had a look at all URLs that contaiend at least one backlink.
+
+![](../plots/2_1_1_pointint_backlinks.png)
+
+<b style='font-size:12pt;'></b> 
+
+<br>
+
+![](../plots/2_1_1_multiint_backlinks.png)
+
+<br>
+
+![](../plots/2_1_1_multiint_backlinks_facet.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* When URL's without any backlinks were excluded:
+
+  - Top ranked URL's contain more backlinks than lower ranked URL's.
+
+  - URL's ranked #1 and #2 contain approx. 3.8 and 2 times, respectively, more backlinks than lower ranked ones.
+  
+  - Large domains contain cosiderably more backlinks than URL's of other domains (median of 170 for large domains versus 5 for others).
+
+<br><br>
+
+
+
+## 2.1.2 Referring Domains
+
+![](../plots/2_1_2_histogram_refdomains.png)
+(**Note:** Logarithmic scale on the x axis.)
+
+<br>
+
+![](../plots/2_1_2_histogram_refdomains_loglog.png)
+(**Note:** Logarithmic scale on both the x and the y axis.)
+
+<br>
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Almost all URL's do not cotain any referring domains.
+
+* This pattern is independent form position (see additional plots below).
+
+* Due to the highly skewed data, any trend found has to be treated with caution - a few URL's with millions of backlinks drive the pattern.
+
+
+![](../plots/2_1_2_pointint_refdomains_0s.png)
+<br>
+![](../plots/2_1_2_multiint_refdomains_0s.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* The number of referring domains show the same pattern as backlinks with more than 95% of URLs containing no referring domains at all (only dots in the point interval, only light bars in the distirbution stripes).
+
+* Again, the maximum range seems not to correlate with position (if than more referring domains are found for URL's on higher positions, but we will look at this later in more detail).
+
+* The trend seems obvious but is not any trend at all - there is a difference of approx. 0.5 referring domains between #1 and lower positions!
+
+
+</details>
+<br><br>
+
+##### Effect of Large Domains
+
+![](../plots/2_1_2_multiint_refdomains_facet_0s.png)
+
+```{r summary-refdomains}
+## summary stats
+avg <- 
+  df_ahrefs %>% 
+  dplyr::select(position, refdomains, is_large) %>%
+  group_by(is_large) %>% 
+  summarize(avg = round(mean(refdomains, na.rm = T), 3)) %>% 
+  pull(avg)
+
+max <- 
+  df_ahrefs %>% 
+  dplyr::select(position, refdomains, is_large) %>%
+  group_by(is_large) %>% 
+  summarize(max = max(refdomains, na.rm = T)) %>% 
+  pull(max)
+```
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* On average, large domains contain `r avg[1]` referring domains while all other URL's contain `r avg[2]`.
+
+* Large domains contain `r max[1]` at a max while all other URL's reach a maximum number of `r max[2]` referring domains. There seems to be no pattern of maximum range wih position.
+
+<br><br>
+
+
+#### Excl. URLs without Referring Domains
+
+Unfortunately, most URLs do not contain any referring domains at all. In a follow-up step, we had a look at all URLs that contaiend at least one backlink.
+
+![](../plots/2_1_2_pointint_refdomains.png)
+
+<br>
+
+![](../plots/2_1_2_multiint_refdomains.png)
+
+<br>
+
+![](../plots/2_1_2_multiint_refdomains_facet.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* When URL's without any backlinks were excluded:
+
+  - Top ranked URL's contain more reffering domains than those that are ranked lower.
+  
+  - URL's ranked #1 and #2 contain approx. 3.2 and 2 times, respectively, more backlinks than lower ranked ones.
+  
+  - Large domains contain cosiderably more referring domains than URL's of other domains (median of 62 versus 3).
+
+<br><br>
+
+
+
+
+## 2.2 Domain Factors
+
+### 2.2.1 Domain Rating
+
+![](../plots/2_2_1_histogram_domrating.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b>
+
+* Half of the URL's have a domain rating below 80, half above 80.
+
+<br>
+
+
+![](../plots/2_2_1_pointint_domrating.png)
+<br>
+![](../plots/2_2_1_multiint_domrating.png)
+
+```{r summaries-domrating-position}
+df <- 
+  df_ahrefs %>% 
+  group_by(position) %>% 
+  summarize(
+    med = median(Domain_rating, na.rm = T),
+    avg = mean(Domain_rating, na.rm = T),
+    min = min(Domain_rating, na.rm = T),
+    max = max(Domain_rating, na.rm = T),
+  ) %>% 
+  arrange(-med)
+```
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Average and median domain rating increase with better position.
+
+* #`r df$position[df$med == max(df$med)]` has the highest average and median rating (`r round(max(df$avg), 1)` and `r max(df$med)`)
+
+* Median above 80 for #1-#4, exactly 80 for #5 and #6, and below 80 for all lower ranked URL's (maximum median of 84 for #2, minimum median of 76 for #10)
+
+* URL's of all positions cover the whole range from `r max(df$min)` to `r min(df$max)`.
+
+</details>
+<br><br>
+
+#### Effect of Large Domains
+
+![](../plots/2_2_1_multiint_domrating_facet.png)
+
+```{r summaries-large-vs-other}
+df <- 
+  df_ahrefs %>% 
+  group_by(is_large) %>% 
+  summarize(
+    med = median(Domain_rating, na.rm = T),
+    avg = mean(Domain_rating, na.rm = T)
+  ) %>% 
+  arrange(-med)
+```
+
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Large domains have remarkably higher average and median domain ratings (mean of `r round(df$avg[df$is_large == "Large Domains"], 1)` and median of `r df$med[df$is_large == "Large Domains"]`) compared to all other domains (`r round(df$avg[df$is_large == "Other Domains"], 1)` and `r df$med[df$is_large == "Other Domains"]`).
+
+* The range of ratings is very narrow for large domains while it is much larger in all other.
+
+* Again, the whole range of possible ratings is covered in all cases.
+
+<br>
+
+
+![](../plots/2_2_1_segments_domrating_largedoms.png)
+
+```{r summary-domrating-largedoms}
+df <- 
+  df_ahrefs %>% 
+  filter(large_domains != "other") %>% 
+  group_by(large_domains) %>% 
+  summarize(m = round(mean(Domain_rating, na.rm = T), 0)) %>% 
+  arrange(-m)
+```
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Large domains have quite similar average ratings ranging between `r min(df$m)` and `r min(df$m)`.
+
+* facebook.com has an average domain rating of `r df$m[df$large_domains == "facebook.com"]`, closely followed by the social media plattforms (twitter.com: `r df$m[df$large_domains == "twitter.com"]`, linkedin.com: `r df$m[df$large_domains == "linkedin.com"]`, youtube.com: `r df$m[df$large_domains == "youtube.com"]`, instagram.com: `r df$m[df$large_domains == "instagram.com"]`, pinterest.com: `r df$m[df$large_domains == "pinterest.com"]`) and en.wikipedia.org (`r df$m[df$large_domains == "en.wikipedia.org"]`) and amazon.com (`r df$m[df$large_domains == "amazon.com"]`).
+
+* The lowest score of all large domains have yellowpages.com (`r df$m[df$large_domains == "yellowpages.com"]`), target.com (`r df$m[df$large_domains == "target.com"]`) and walmart.com (`r df$m[df$large_domains == "walmart.com"]`)
+
+* In general, lower ratings correlate with lower positions for most large domains with the exception of ebay.com and walmart.com.
+
+<br><br>
+
+
+
+### 2.2.2 Page Speed 
+
+![](../plots/2_2_2_histogram_speed.png)
+(**Note:** Logarithmic scale on the x axis.)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* On a logarithmic sale, Alexa's daily time-on-site measure is distributed normally with a mean of 197.7 seconds.
+
+* The range covers below 10 and more than 10.000 seconds (~167 minutes).
+
+<br><br>
+
+![](../plots/2_2_2_pointint_speed.png)
+
+<br>
+
+![](../plots/2_2_2_multiint_speed_zoom.png)
+(**Note:** We excluded the 100% range here to make the pattern better visible. A plot containing the 100% data as well can be found after the key takeaways.)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Median page speed is 1.65 seconds. This pattern is independent from position.
+
+* Also the range of speeds does not differ among positions.
+
+* Most reported page speeds are below 5,000 milliseconds (5 seconds) but a few URL's are remarkably slower with speeds up to 7M milliseconds (= 1.9 hours)
+
+* **Note:** Again, the trend is driven by a few outliers with very values of page speed - I would not conclude here that better-ranked URL's are slower. More likely, a few heavy and slow pages that are often ranked on the top 3 (for other reasons than page speed) skew the trend. This also becomes obvious when looking at the trend of median (dots) which seems to increases (slightly) with better positioning. If you prefer, we can run a similar analysis on excluding the 5% outlier with slow speed.
+
+<br>
+
+<details>
+  <summary><b style='font-size:10pt;'>Additional plot including 100% range:</b></summary>
+![](../plots/2_2_2_multiint_speed.png)
+
+
+
+<br><br>
+
+
+<br><br>
+
+
+
+### 2.2.3 Time-on-Site 
+
+![](../plots/2_2_3_histogram_time.png)
+(**Note:** Logarithmic scale on the x axis.)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* On a logarithmic sale, Alexa's daily time-on-site measure is distributed normally with a mean of 197.7 seconds.
+
+* The range covers below 10 and more than 10.000 seconds (~167 minutes).
+
+<br><br>
+
+![](../plots/2_2_3_pointint_time_lm.png)
+
+<br>
+
+![](../plots/2_2_3_multiint_time_log.png)
+(**Note:** Logarithmic scale on the x axis. A plot with a simple linea axis can be found below after the key takeaways.)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Time on site is positively correlated with position: the time spend daily increase by ~3 seconds per position (linear model: position = 214.18 - 2.93 * time-on-site)
+
+<br>
+
+<details>
+  <summary><b style='font-size:10pt;'>Additional plot without logarithmic scale:</b></summary>
+  ![](../plots/2_2_3_multiint_time.png)
+</details>
+<br>
+
+<br><br>
+
+
+
+
+
+## 2.3 Page-level Factors
+
+
+### 2.3.1 HTML Tags (Matching of Title and H1 Tag with Keyword)
+
+#### Title Match
+
+![](../plots/2_3_1_histogram_title.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* URL titles contain around 65% to 85% of the keywords.
+
+<br>
+
+![](../plots/2_3_1_pointint_title_lm.png)
+
+<br>
+
+![](../plots/2_3_1_multiint_title.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* The median and range of matching between title and keyword is almost the same among positions with 50% of URL titles matching between 60% and 95% of the keyword.
+
+* The linear fitting predicts an increase of around 1% when going from position 10 to position 1.
+
+
+- **Note:** The support for the linear model is very low (R^2 < 0.001).
+
+<br><br>
+
+
+
+#### H1 Tag Match
+
+![](../plots/2_3_1_histogram_h1.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* H1 tags of most URL's contain around 60% to 80% of the keywords.
+
+<br>
+![](../plots/2_3_1_pointint_h1_lm.png)
+
+<br>
+
+![](../plots/2_3_1_multiint_h1.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* There is a slighlty negative trend of H1 tag matching with the keyword when URL's are ranked at higher positions.
+
+* The median and range of matching between title and keyword is almost the same among positions: the median varies between 70.8 (#1 and #2) and 71.9% (#5) and 50% of URL titles match between ~60% and ~95% of the keyword. 
+
+<br><br>
+
+
+### 2.3.2 Page Size (HTML)
+
+![](../plots/2_3_2_histogram_pagesize.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Most URL's have page sizes in the range of 10 to 1,00 with a mean of 156.
+
+<br>
+
+!!! Falscher Plot. Der angezeigte Plot ist für URL Rating
+
+![](../plots/2_3_2_pointint_pagesize_lm.png)
+
+<br>
+
+![](../plots/2_3_2_multiint_pagesize.png)
+
+<br>
+
+![](../plots/2_3_2_multiint_pagesize_zoom.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* There is no correlation of page size with position.
+
+* Page size does not differ much among positions.
+
+* Most URL's are quite small (around 100 units) and some few are very large up to and more than 60,000 (light-green bars in second plot)
+
+* The median page size is, mostly independent from position, around 94 (93.7 overall, range of 90.5 on #10 to 96.4 on #3).
+
+<br><br>
+
+
+
+### 2.3.3 Content Score
+
+![](../plots/2_3_3_multiint_contentscope.png)
+ 
+ 
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Higher ocntent scores correlate with better positions.
+
+* On both devices, desktop and mobile, an increase of 1 in content score increase position by 1.  
+
+<br>
+
+To focus a bit more on the main pattern, we keep only the major 50% URL's of each position.
+
+![](../plots/2_3_3_multiint_contentscope_zoom.png)
+ 
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Now the trend in increase of position with content score is even more obvious.
+
+<br><br>
+
+
+
+
+<br><br>
+
+
+### 2.3.4 Anchor Text
+
+#### % Exact Matches
+
+![](../plots/2_3_5_multiint_mexact.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Not much to see here: More than 95% of all anchor texts did not match the keyword at all, independent of position (all bars light green).
+
+
+![](../plots/2_3_5_pointint_mexact.png)
+  <br>
+  *Note:* 
+  In this case, the segments lay all behind the dot, meaning that more than 95% of the values are (at least, but actually exactly) zero. The fitting accounts also for a few URL's with very high values (not contained in the major 95%), thus it looks a bit off. However, we discourage you from concluding anything from this plot and thus removed it from the main report - the change is too small to be relevant. 
+</details>
+<br><br>
+
+
+#### % Partial Matches
+
+![](../plots/2_3_5_pointint_mpartial.png)
+
+*Note:* 
+In this case, the segments lay all behind the dot, meaning that more than 95% of the values is (at least, but actually exactly) zero. The fitting accounts also for a few URL's with very high values (not contained in the major 95%), thus it looks a bit off. However, we discourage you from concluding anything from this plot since the change is too small to explain anything at all.
+
+![](../plots/2_3_5_multiint_mpartial.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Same pattern as with exact matches: More than 95% of all anchor texts did not even match the keyword partially, independent of position (all bars light green).
+
+<br><br>
+
+
+
+### 2.3.5 URL Rating
+
+![](../plots/2_3_6_histogram_urlrating.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* URL ratings are generally low in most cases with an average of 11.2.
+
+<br>
+
+![](../plots/2_3_6_pointint_urlrating_lm.png)
+
+<br>
+
+![](../plots/2_3_6_multiint_urlrating.png)
+
+```{r summary-url-rating}
+df <-
+  df_ahrefs %>% 
+  group_by(position) %>% 
+  summarize(m = median(URL_rating, na.rm = T)) %>% 
+  arrange(-m)
+```
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Median URL rating is almost similar across positions (range: `r min(df$m)`-`r max(df$m)`).
+
+* URL's on position 1 to 6 have a median of 12, lower ranked a median of 11.
+
+* URL rating is on average `r round(mean(df_ahrefs$URL_rating, na.rm = T), 1)`.
+
+#### Effect of Large Domains
+
+![](../plots/2_3_6_multiint_urlrating_facet.png)
+
+```{r summary-url-rating-large-vs-other}
+df <-
+  df_ahrefs %>% 
+  group_by(is_large) %>% 
+  summarize(
+    med = median(URL_rating, na.rm = T),
+    avg = round(mean(URL_rating, na.rm = T), 1)
+  )
+```
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Large domains score also higher than other domains (median of `r df$med[df$is_large == "Large Domains"]` versus `r df$med[df$is_large == "Other Domains"]`; mean of `r df$avg[df$is_large == "Large Domains"]` versus  `r df$avg[df$is_large == "Other Domains"]`).
+
+* Ranges of URL rating are in general very narrow for most URL's, no matter if belonging to a large or other domains.
+
+<br><br>
+
+
+![](../plots/2_3_6_segments_urlrating_largedoms.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* In general not much variation in average URL rating across positions.
+
+* Among the top large domains with regard to URL rating are social media plattforms (facebook.com, twitter.com, instagram.com, youtube.com, linkedin.com), en.wikipedia.org and amazon.com.
+
+* instagram.com and en.wikipedia.org have by for the highest URL ratings with values above 70%.
+
+<br><br>
+
+
+### 2.3.6 URL Length
+
+![](../plots/2_3_7_histogram_urllength.png)
+
+<br>
+
+![](../plots/2_3_7_histogram_urllength_log.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Most URL's are between 40 and 100 characters long with a mean of 66.
+
+<br>
+
+```{r linear-model-url-length}
+## linear model
+lm_ul <- summary(lm(url_length ~ position, data = df_ahrefs))
+```
+
+
+![](../plots/2_3_7_multiint_urllength.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* There is a wide range of URL lengths, some with more than 2000 characters (maximum of 2075 for #8). 
+
+* Since the pattern is quite linear, we used a simple linear regression here:  length of URL = `r round(lm_ul$coefficients[1], 3)` + `r round(lm_ul$coefficients[2], 3)` * position, but very low R2 of `r round(lm_ul$r.squared, 2)`)
+
+* Average length of URL's increase with lower ranking &rarr; URL's on #10 are on average `r round((lm_ul$coefficients[1] + lm_ul$coefficients[2] * 10) - (lm_ul$coefficients[1] + lm_ul$coefficients[2]), 1)` characters shorter (`r round(lm_ul$coefficients[1] + lm_ul$coefficients[2] * 10, 1)`) than those on #1 (`r round(lm_ul$coefficients[1] + lm_ul$coefficients[2], 1)`).
+
+* In general, the ranges of URL length are quite the same among positions but the maximum length increases slightly with lower ranking as well. Especially #1 and #2 have low maxima compared to the other 8 positions.
+
+* The majority of data (> 95%) has relatively short URL names with an overall average of ~66 characters.
+
+* To see the trends in more detail, we can either use a log scale or use the same plot with the main 75% percent per position only.
+
+* Range of URL length is almost the same among positions with a slight trend with shorter URL's on top positions.
+
+<br><br>
+
+
+![](../plots/2_3_7_pointint_urllength.png)
+<br>
+![](../plots/2_3_7_multiint_urllength_zoom.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Indeed, when focussing on the majority of URL's the distribution of URL length is almost the same for all positions with slighlty shorter URL's for most top ranked pages.
+
+<br><br>
+
+<br>
+
+<details>
+  <summary><b style='font-size:10pt;'>Additional plots</b></summary>
+  **Logarithmic scale:**  
+  ![](../plots/2_3_7_multiint_urllength_log.png)
+  Another way to look it bit more closely at differences in URL length.
+
+</details>
+<br><br>
+
+
+#### Effect of Large Domains
+
+![](../plots/2_3_7_multiint_urllength_facet.png)
+
+```{r summary-url-length}
+## summary stats
+m <- 
+  df_ahrefs %>% 
+  dplyr::select(position, url_length, is_large) %>%
+  group_by(is_large) %>% 
+  summarize(m = round(mean(url_length, na.rm = T), 1)) %>% 
+  pull(m)
+```
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* URL's of large domains are on average slightly shorter than other URL's (`r m[1]` characters versus `r m[2]` characters)
+
+* The decrease in average length is not as clear as for other domians with a increase of only 4.8 characters when comparing #1 and #10 (versus 10.9 characters for all other domains).
+
+<br><br>
+
+![](../plots/2_3_7_segments_urllength_largedoms.png)
+
+```{r summary-url-length-large-vs-other}
+df <- 
+  df_ahrefs %>% 
+  group_by(large_domains) %>% 
+  summarize(
+    avg = mean(url_length, na.rm = T),
+    max = max(url_length, na.rm = T)
+  ) %>% 
+  arrange(-avg)
+```
+
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* `r df$large_domains[1]` has the longest average URL's (`r df$avg[1]` characters), followed by `r df$large_domains[2]` (`r df$avg[2]` characters), `r df$large_domains[3]` (`r df$avg[3]` characters) and `r df$large_domains[4]` (`r df$avg[4]` characters).
+
+* Some URL's hosted by facebook.com (`r df$max[df$large_domains == "facebook.com"]` characters) and ebay.com (`r df$max[df$large_domains == "ebay.com"]` characters) consist of the most characters.
+
+* There is no clear pattern of URL length versus position; more often are longer URL's correlated with lower position but not always.
+
+<br><br>
+
+
+### 2.3.7 Word Amount 
+
+![](../plots/2_3_8_histogram_words.png)
+
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Most URL's contain between 100 and 10,000 words.
+
+<br>
+
+![](../plots/2_3_8_pointint_words_lm.png)
+
+<br>
+
+![](../plots/2_3_8_multiint_words.png)
+
+<br>
+
+![](../plots/2_3_8_multiint_words_log.png)
+
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Most URL's (> 95%) contain between 100 and 10.000 words in their body with a median of 931 words.
+
+* The linear fitting predicts a tiny decrease in body word amount of 2.47 words by increasing position by 1 (linear model: word amount = 1461.1 - 2.47 * position).
+
+- **Note:** The support for the linear model is super low (R^2 < 0.00001)!
+
+<br>
+
+
+
+
+<br><br>
+
+### 2.3.8 Schema.org Usage
+
+![](../plots/2_1_3_bars_schema.png)
+
+<b style='font-size:12pt;'>Key takeaways:</b> 
+
+* Most URL's do not use schema markup (72.6%).
+
+* If there is any trend, than that #1 and #2 have slightly less often URL's with schema markup (25.1% and 26.3%, all other positions between 27.2% and 28.1%).
+
+<br><br>
+
+
+
+***
+
+<details>
+ <summary>Session Info</summary>
+```{r sessionInfo, echo = F}
+sessionInfo()
+```
+</details>
+
+<br>

@@ -1,0 +1,4766 @@
+---
+title: "We Analyzed 11 Million Google Search Results. Here’s What We Learned About SEO [UPDATE] - Plots"
+author: "Cédric Scherer & Daniel Kupka (FrontPage Data) & Brian Dean (backlinko.com)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: paper
+    highlight: kate
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+knitr::knit_hooks$set(inline = function(x) {
+  prettyNum(x, big.mark = ",", small.mark = ",", scientific = F)
+})
+```
+
+```{r prep}
+## packages
+library(tidyverse)
+library(dbplyr)
+library(RMySQL)
+library(DBI)
+library(odbc)
+library(tidybayes)
+library(extrafont)
+
+extrafont::loadfonts()
+
+## save plots?
+save <- TRUE
+#save <- FALSE
+
+## quality of png's
+dpi <- 750
+
+## theme updates
+theme_set(ggthemes::theme_clean(base_size = 15, base_family = "Montserrat"))
+
+theme_update(plot.margin = margin(30, 30, 30, 30),
+             plot.background = element_rect(color = "white",
+                                            fill = "white"),
+             plot.title = element_text(family = "Montserrat SemiBold",
+                                       size = 16,
+                                       face = "bold",
+                                       lineheight = 1.15,
+                                       hjust = .5,
+                                       margin = margin(10, 0, 25, 0)),
+             #plot.title.position = "plot",
+             axis.line.x = element_line(color = "black",
+                                        size = .8),
+             axis.line.y = element_line(color = "black",
+                                        size = .8),
+             axis.title.x = element_text(family = "Montserrat SemiBold",
+                                         size = 16,
+                                         face = "bold",
+                                         margin = margin(t = 20)),
+             axis.title.y = element_text(family = "Montserrat SemiBold",
+                                         size = 16,
+                                         face = "bold",
+                                         margin = margin(r = 20)),
+             axis.text = element_text(size = 11,
+                                      color = "black",
+                                      face = "bold"),
+             axis.text.x = element_text(margin = margin(t = 10)),
+             axis.text.y = element_text(margin = margin(r = 10)),
+             axis.ticks = element_blank(),
+             panel.grid.major.x = element_line(size = .6,
+                                               color = "#eaeaea",
+                                               linetype = "solid"),
+             panel.grid.major.y = element_line(size = .6,
+                                               color = "#eaeaea",
+                                               linetype = "solid"),
+             panel.grid.minor.x = element_line(size = .6,
+                                               color = "#eaeaea",
+                                               linetype = "solid"),
+             panel.grid.minor.y = element_blank(),
+             panel.spacing.x = unit(4, "lines"),
+             panel.spacing.y = unit(2, "lines"),
+             legend.position = "top",
+             legend.title = element_text(family = "Montserrat",
+                                         color = "black",
+                                         size = 11),
+             legend.text = element_text(family = "Montserrat",
+                                        color = "black",
+                                        size = 9),
+             legend.background = element_rect(fill = NA,
+                                              color = NA),
+             legend.key = element_rect(color = NA, fill = NA),
+             legend.key.width = unit(5, "lines"),
+             legend.spacing.x = unit(.05, "pt"),
+             legend.spacing.y = unit(.55, "pt"),
+             legend.margin = margin(0, 0, 10, 0),
+             strip.text = element_text(face = "bold",
+                                       margin = margin(b = 10)))
+
+## theme settings for flipped plots
+theme_flip <-
+  theme(panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_line(size = .6,
+                                          color = "#eaeaea"))
+
+## numeric format for labels
+num_format <- scales::format_format(big.mark = ",", small.mark = ",", scientific = F)
+
+## main color backlinko
+bl_col <- "#00d188"
+
+## colors + labels for interval stripes
+int_cols <- c("#bce2d5", "#79d8b6", bl_col, "#009f66", "#006c45", "#003925")
+int_perc <- c("100%", "95%", "75%", "50%", "25%", "5%")
+
+## gradient colors for position
+colfunc <- colorRampPalette(c(bl_col, "#bce2d5"))
+pos_cols <- colfunc(10)
+```
+
+
+# Specification
+
+We aim to update this article here with new data: https://backlinko.com/search-engine-ranking
+
+In this doc you can find some info on SEO: https://docs.google.com/document/d/1f35uIyRgfp7lm2bjKJWKJCrwxWue8iygXTFl9VI3_mM/edit#heading=h.p9213a6k452a
+
+
+I would suggest you start with analysing data from the Ahrefs data, then move on to the scraped data and lastly alexa api and content scope data.
+
+**3 relevant files**
+
+*1. raw file can be downlaoded here and should be named ahrefs_raw.csv and placed under raw_data; Size 1,5gb*
+https://drive.google.com/file/d/1WCa5aXmMOdamU6Bs4ObU0CsNg57u5X51/view
+
+```{r data}
+## clean data:
+##   - remove NA columns
+##   - only keywords with 5 samples (positions) or more
+##   - assign large domains
+
+large_doms <- c("youtube.com", "amazon.com", "facebook.com", "en.wikipedia.org",
+                "pinterest.com", "yelp.com", "tripadvisor.com", "ebay.com",
+                "reddit.com", "linkedin.com", "twitter.com", "imdb.com",
+                "walmart.com", "yellowpages.com", "mapquest.com", "etsy.com",
+                "quora.com", "instagram.com", "target.com")
+
+rds_raw <- here::here("proc_data", "ahrefs_raw.Rds")
+rds_proc <- here::here("proc_data", "ahrefs_proc.Rds")
+
+if(!file.exists(rds_proc)){
+
+  if(!file.exists(rds_raw)){
+    df_ahrefs_raw <- data.table::fread(here::here("raw_data", "ahrefs_raw.csv"))
+    saveRDS(df_ahrefs_raw, rds_raw)
+  }else{
+    df_ahrefs_raw <- readRDS(rds_raw)
+  }
+
+  df_ahrefs <-
+    df_ahrefs_raw %>%
+    dplyr::select(-exact_matches, -partial_matches, -anchors) %>%
+    rename(
+      perc_exact_matches = `% exact_matches`,
+      perc_partial_matches = `% partial_matches`,
+    ) %>%
+    group_by(keyword) %>%
+    filter(n() >= 5) %>%
+    ungroup() %>%
+    mutate(
+      large_domains = case_when(
+        str_detect(url, large_doms[1]) ~ !!large_doms[1],
+        str_detect(url, large_doms[2]) ~ !!large_doms[2],
+        str_detect(url, large_doms[3]) ~ !!large_doms[3],
+        str_detect(url, large_doms[4]) ~ !!large_doms[4],
+        str_detect(url, large_doms[5]) ~ !!large_doms[5],
+        str_detect(url, large_doms[6]) ~ !!large_doms[6],
+        str_detect(url, large_doms[7]) ~ !!large_doms[7],
+        str_detect(url, large_doms[8]) ~ !!large_doms[8],
+        str_detect(url, large_doms[9]) ~ !!large_doms[9],
+        str_detect(url, large_doms[10]) ~ !!large_doms[10],
+        str_detect(url, large_doms[11]) ~ !!large_doms[11],
+        str_detect(url, large_doms[12]) ~ !!large_doms[12],
+        str_detect(url, large_doms[13]) ~ !!large_doms[13],
+        str_detect(url, large_doms[14]) ~ !!large_doms[14],
+        str_detect(url, large_doms[15]) ~ !!large_doms[15],
+        str_detect(url, large_doms[16]) ~ !!large_doms[16],
+        str_detect(url, large_doms[17]) ~ !!large_doms[17],
+        str_detect(url, large_doms[18]) ~ !!large_doms[18],
+        str_detect(url, large_doms[19]) ~ !!large_doms[19],
+        TRUE ~ "other"
+      ),
+      is_large = if_else(large_domains == "other", "Other Domains", "Large Domains"),
+      url_length = nchar(url)
+    )
+
+  saveRDS(df_ahrefs, rds_proc)
+}else{
+  df_ahrefs <-readRDS(rds_proc)
+}
+
+rm(rds_raw, rds_n, rds_proc, df_ahrefs_raw)
+```
+
+
+*2 scraped data can be accessed through MySQL*
+Total size around 25gb; Please note that the MySQL has a smaller sample size (around 7,6m rows) since we removed the larger domains like amazon from the scraping.
+
+```{r connection-mysql, eval = F}
+#establish connection
+con <- DBI::dbConnect(
+  drv = RMySQL::MySQL(),
+  host = "5.189.157.199",
+  user = "introlab",
+  password = "wkCdCjFUxzw8x",
+  dbname = "introlab",
+  port = 3306)
+
+
+#dbListTables(con) #see dbs
+#dbListFields(con, "website") #see columns of db
+#tbl(con, "website") # see full data frame; not all relevant for the study
+
+## url position data for joining later
+df_pos <-
+  df_ahrefs %>%
+  dplyr::select(position, url) %>%
+  filter(!is.na(position))
+
+## url position + keyword data for joining later
+df_pos_kw <-
+  df_ahrefs %>%
+  dplyr::select(position, url, keyword) %>%
+  filter(!is.na(position))
+```
+
+```{r sql-data-pagespeed}
+rds_speed <- here::here("proc_data", "sql_pagespeed.Rds")
+
+if(!file.exists(rds_speed)) {
+
+  db_speed <- tbl(con, "website") %>%
+    dplyr::select(alexa_speed_msec, url) %>%
+    collect()
+
+  df_speed <-
+    db_speed %>%
+    inner_join(df_pos) %>%
+    filter(!is.na(alexa_speed_msec)) %>%
+    mutate(
+        large_domains = case_when(
+          str_detect(url, large_doms[1]) ~ !!large_doms[1],
+          str_detect(url, large_doms[2]) ~ !!large_doms[2],
+          str_detect(url, large_doms[3]) ~ !!large_doms[3],
+          str_detect(url, large_doms[4]) ~ !!large_doms[4],
+          str_detect(url, large_doms[5]) ~ !!large_doms[5],
+          str_detect(url, large_doms[6]) ~ !!large_doms[6],
+          str_detect(url, large_doms[7]) ~ !!large_doms[7],
+          str_detect(url, large_doms[8]) ~ !!large_doms[8],
+          str_detect(url, large_doms[9]) ~ !!large_doms[9],
+          str_detect(url, large_doms[10]) ~ !!large_doms[10],
+          str_detect(url, large_doms[11]) ~ !!large_doms[11],
+          str_detect(url, large_doms[12]) ~ !!large_doms[12],
+          str_detect(url, large_doms[13]) ~ !!large_doms[13],
+          str_detect(url, large_doms[14]) ~ !!large_doms[14],
+          str_detect(url, large_doms[15]) ~ !!large_doms[15],
+          str_detect(url, large_doms[16]) ~ !!large_doms[16],
+          str_detect(url, large_doms[17]) ~ !!large_doms[17],
+          str_detect(url, large_doms[18]) ~ !!large_doms[18],
+          str_detect(url, large_doms[19]) ~ !!large_doms[19],
+          TRUE ~ "other"
+        ),
+        is_large = if_else(large_domains == "other", "Other Domains", "Large Domains")
+    )
+
+  rm(db_speed)
+
+  saveRDS(df_speed, rds_speed)
+}
+
+rm(rds_speed)
+```
+
+```{r sql-data-schema}
+rds_schema <- here::here("proc_data", "sql_schema.Rds")
+
+if(!file.exists(rds_schema)) {
+
+  db_schema <- tbl(con, "website") %>%
+    dplyr::select(schema_markup_exists, url) %>%
+    collect()
+
+  df_schema <-
+    db_schema %>%
+    inner_join(df_pos) %>%
+    filter(!is.na(schema_markup_exists)) %>%
+    mutate(
+        large_domains = case_when(
+          str_detect(url, large_doms[1]) ~ !!large_doms[1],
+          str_detect(url, large_doms[2]) ~ !!large_doms[2],
+          str_detect(url, large_doms[3]) ~ !!large_doms[3],
+          str_detect(url, large_doms[4]) ~ !!large_doms[4],
+          str_detect(url, large_doms[5]) ~ !!large_doms[5],
+          str_detect(url, large_doms[6]) ~ !!large_doms[6],
+          str_detect(url, large_doms[7]) ~ !!large_doms[7],
+          str_detect(url, large_doms[8]) ~ !!large_doms[8],
+          str_detect(url, large_doms[9]) ~ !!large_doms[9],
+          str_detect(url, large_doms[10]) ~ !!large_doms[10],
+          str_detect(url, large_doms[11]) ~ !!large_doms[11],
+          str_detect(url, large_doms[12]) ~ !!large_doms[12],
+          str_detect(url, large_doms[13]) ~ !!large_doms[13],
+          str_detect(url, large_doms[14]) ~ !!large_doms[14],
+          str_detect(url, large_doms[15]) ~ !!large_doms[15],
+          str_detect(url, large_doms[16]) ~ !!large_doms[16],
+          str_detect(url, large_doms[17]) ~ !!large_doms[17],
+          str_detect(url, large_doms[18]) ~ !!large_doms[18],
+          str_detect(url, large_doms[19]) ~ !!large_doms[19],
+          TRUE ~ "other"
+        ),
+        is_large = if_else(large_domains == "other", "Other Domains", "Large Domains")
+    )
+
+  rm(db_schema)
+
+  saveRDS(df_schema, rds_schema)
+}
+
+rm(rds_schema)
+```
+
+```{r sql-data-timeonsite}
+rds_time <- here::here("proc_data", "sql_timeonsite.Rds")
+
+if(!file.exists(rds_time)) {
+
+  db_time <- tbl(con, "website") %>%
+    dplyr::select(alexa_daily_time_on_site_sec, url) %>%
+    collect()
+
+  df_time <-
+    db_time %>%
+    inner_join(df_pos) %>%
+    filter(!is.na(alexa_daily_time_on_site_sec)) %>%
+    mutate(
+        large_domains = case_when(
+          str_detect(url, large_doms[1]) ~ !!large_doms[1],
+          str_detect(url, large_doms[2]) ~ !!large_doms[2],
+          str_detect(url, large_doms[3]) ~ !!large_doms[3],
+          str_detect(url, large_doms[4]) ~ !!large_doms[4],
+          str_detect(url, large_doms[5]) ~ !!large_doms[5],
+          str_detect(url, large_doms[6]) ~ !!large_doms[6],
+          str_detect(url, large_doms[7]) ~ !!large_doms[7],
+          str_detect(url, large_doms[8]) ~ !!large_doms[8],
+          str_detect(url, large_doms[9]) ~ !!large_doms[9],
+          str_detect(url, large_doms[10]) ~ !!large_doms[10],
+          str_detect(url, large_doms[11]) ~ !!large_doms[11],
+          str_detect(url, large_doms[12]) ~ !!large_doms[12],
+          str_detect(url, large_doms[13]) ~ !!large_doms[13],
+          str_detect(url, large_doms[14]) ~ !!large_doms[14],
+          str_detect(url, large_doms[15]) ~ !!large_doms[15],
+          str_detect(url, large_doms[16]) ~ !!large_doms[16],
+          str_detect(url, large_doms[17]) ~ !!large_doms[17],
+          str_detect(url, large_doms[18]) ~ !!large_doms[18],
+          str_detect(url, large_doms[19]) ~ !!large_doms[19],
+          TRUE ~ "other"
+        ),
+        is_large = if_else(large_domains == "other", "Other Domains", "Large Domains")
+    )
+
+  rm(db_time)
+
+  saveRDS(df_time, rds_time)
+}
+
+rm(rds_time)
+```
+
+```{r sql-data-title}
+## functions to calculate matches with keyword
+calculate_keyword_match <- function(keyword, match) {
+  if (!is.character(match)) return(0)
+  if (length(match) != 1) return(0)
+  if (is.na(match)) return(0)
+
+  1 - stringdist::stringdist(keyword, match, method = "cosine")
+}
+
+calculate_keyword_best_match <- function(keyword, matches, return_best_match = FALSE) {
+  if (!is.character(matches)) return(0)
+  matches <- matches[!is.na(matches)]
+  if (length(matches) == 0) return(0)
+  # if (is.na(matches)) return(0)
+  if (length(matches) == 1) {
+    if (matches == "") return(0)
+  }
+  dists <- 1 - map_dbl(matches, ~ stringdist::stringdist(keyword, ., method = "cosine"))
+
+  if (return_best_match) {
+    matches[which.max(dists)]
+  } else {
+    max(dists , na.rm = TRUE)
+  }
+}
+
+
+rds_title <- here::here("proc_data", "sql_title.Rds")
+
+if(!file.exists(rds_title)) {
+
+  db_title <- tbl(con, "website") %>%
+    dplyr::select(title, url) %>%
+    collect()
+
+  df_title <-
+    db_title %>%
+    inner_join(df_pos_kw) %>%
+    filter(
+      !is.na(title),
+      !is.na(url),
+      !is.na(keyword)
+    ) %>%
+    mutate(
+      large_domains = case_when(
+        str_detect(url, large_doms[1]) ~ !!large_doms[1],
+        str_detect(url, large_doms[2]) ~ !!large_doms[2],
+        str_detect(url, large_doms[3]) ~ !!large_doms[3],
+        str_detect(url, large_doms[4]) ~ !!large_doms[4],
+        str_detect(url, large_doms[5]) ~ !!large_doms[5],
+        str_detect(url, large_doms[6]) ~ !!large_doms[6],
+        str_detect(url, large_doms[7]) ~ !!large_doms[7],
+        str_detect(url, large_doms[8]) ~ !!large_doms[8],
+        str_detect(url, large_doms[9]) ~ !!large_doms[9],
+        str_detect(url, large_doms[10]) ~ !!large_doms[10],
+        str_detect(url, large_doms[11]) ~ !!large_doms[11],
+        str_detect(url, large_doms[12]) ~ !!large_doms[12],
+        str_detect(url, large_doms[13]) ~ !!large_doms[13],
+        str_detect(url, large_doms[14]) ~ !!large_doms[14],
+        str_detect(url, large_doms[15]) ~ !!large_doms[15],
+        str_detect(url, large_doms[16]) ~ !!large_doms[16],
+        str_detect(url, large_doms[17]) ~ !!large_doms[17],
+        str_detect(url, large_doms[18]) ~ !!large_doms[18],
+        str_detect(url, large_doms[19]) ~ !!large_doms[19],
+        TRUE ~ "other"
+      ),
+      is_large = if_else(large_domains == "other", "Other Domains", "Large Domains"),
+      title_match = map2_dbl(keyword, title, ~ calculate_keyword_match(.x, .y)),
+      title_best_match = map2_dbl(keyword, title, ~ calculate_keyword_best_match(.x, .y))
+  ) %>%
+  dplyr::select(-title)
+
+  rm(db_title)
+
+  saveRDS(df_title, rds_title)
+}
+
+rm(rds_title)
+```
+
+```{r sql-data-h1-tag}
+rds_h1 <- here::here("proc_data", "sql_h1tag.Rds")
+
+if(!file.exists(rds_h1)) {
+
+  db_h1 <- tbl(con, "website") %>%
+    dplyr::select(h1_tag_body, url) %>%
+    collect()
+
+  df_h1 <-
+    db_h1 %>%
+    inner_join(df_pos_kw) %>%
+    filter(
+      !is.na(h1_tag_body),
+      !is.na(url),
+      !is.na(keyword)
+    ) %>%
+    mutate(
+      large_domains = case_when(
+        str_detect(url, large_doms[1]) ~ !!large_doms[1],
+        str_detect(url, large_doms[2]) ~ !!large_doms[2],
+        str_detect(url, large_doms[3]) ~ !!large_doms[3],
+        str_detect(url, large_doms[4]) ~ !!large_doms[4],
+        str_detect(url, large_doms[5]) ~ !!large_doms[5],
+        str_detect(url, large_doms[6]) ~ !!large_doms[6],
+        str_detect(url, large_doms[7]) ~ !!large_doms[7],
+        str_detect(url, large_doms[8]) ~ !!large_doms[8],
+        str_detect(url, large_doms[9]) ~ !!large_doms[9],
+        str_detect(url, large_doms[10]) ~ !!large_doms[10],
+        str_detect(url, large_doms[11]) ~ !!large_doms[11],
+        str_detect(url, large_doms[12]) ~ !!large_doms[12],
+        str_detect(url, large_doms[13]) ~ !!large_doms[13],
+        str_detect(url, large_doms[14]) ~ !!large_doms[14],
+        str_detect(url, large_doms[15]) ~ !!large_doms[15],
+        str_detect(url, large_doms[16]) ~ !!large_doms[16],
+        str_detect(url, large_doms[17]) ~ !!large_doms[17],
+        str_detect(url, large_doms[18]) ~ !!large_doms[18],
+        str_detect(url, large_doms[19]) ~ !!large_doms[19],
+        TRUE ~ "other"
+      ),
+      is_large = if_else(large_domains == "other", "Other Domains", "Large Domains"),
+      h1_match = map2_dbl(keyword, h1_tag_body, ~ calculate_keyword_match(.x, .y)),
+      h1_best_match = map2_dbl(keyword, h1_tag_body, ~ calculate_keyword_best_match(.x, .y))
+    ) %>%
+    dplyr::select(-h1_tag_body)
+
+  rm(db_h1)
+
+  saveRDS(df_h1, rds_h1)
+}
+
+rm(rds_h1)
+```
+
+```{r sql-data-page-size}
+rds_size <- here::here("proc_data", "sql_pagesize.Rds")
+
+if(!file.exists(rds_size)) {
+
+  db_size <- tbl(con, "website") %>%  #my guess is that the best approach is to download the desired columns, save as seperate csvs, join with position data and then do the analysis/graphs
+    dplyr::select(page_size, url) %>%
+    collect()  #download data from db; you can use operators without loading to db locally (lazy loading)
+
+  # for this query, it took me 5 minutes to download the data
+  # CED: okay, works but takes a lot longer for me (~12 min)
+
+  df_size <-
+    db_size %>%
+    inner_join(df_pos) %>%
+    filter(!is.na(page_size)) %>%
+    mutate(
+        large_domains = case_when(
+          str_detect(url, large_doms[1]) ~ !!large_doms[1],
+          str_detect(url, large_doms[2]) ~ !!large_doms[2],
+          str_detect(url, large_doms[3]) ~ !!large_doms[3],
+          str_detect(url, large_doms[4]) ~ !!large_doms[4],
+          str_detect(url, large_doms[5]) ~ !!large_doms[5],
+          str_detect(url, large_doms[6]) ~ !!large_doms[6],
+          str_detect(url, large_doms[7]) ~ !!large_doms[7],
+          str_detect(url, large_doms[8]) ~ !!large_doms[8],
+          str_detect(url, large_doms[9]) ~ !!large_doms[9],
+          str_detect(url, large_doms[10]) ~ !!large_doms[10],
+          str_detect(url, large_doms[11]) ~ !!large_doms[11],
+          str_detect(url, large_doms[12]) ~ !!large_doms[12],
+          str_detect(url, large_doms[13]) ~ !!large_doms[13],
+          str_detect(url, large_doms[14]) ~ !!large_doms[14],
+          str_detect(url, large_doms[15]) ~ !!large_doms[15],
+          str_detect(url, large_doms[16]) ~ !!large_doms[16],
+          str_detect(url, large_doms[17]) ~ !!large_doms[17],
+          str_detect(url, large_doms[18]) ~ !!large_doms[18],
+          str_detect(url, large_doms[19]) ~ !!large_doms[19],
+          TRUE ~ "other"
+        ),
+        is_large = if_else(large_domains == "other", "Other Domains", "Large Domains")
+    )
+
+  rm(db_size)
+
+  saveRDS(df_size, rds_size)
+}
+
+rm(rds_size)
+```
+
+```{r sql-data-words-body}
+rds_words <- here::here("proc_data", "sql_wordsbody.Rds")
+
+if(!file.exists(rds_words)) {
+
+  db_words <- tbl(con, "website") %>%
+    dplyr::select(word_amount_body, url) %>%
+    collect()
+
+  df_words <-
+    db_words %>%
+    inner_join(df_pos) %>%
+    filter(!is.na(word_amount_body)) %>%
+    mutate(
+        large_domains = case_when(
+          str_detect(url, large_doms[1]) ~ !!large_doms[1],
+          str_detect(url, large_doms[2]) ~ !!large_doms[2],
+          str_detect(url, large_doms[3]) ~ !!large_doms[3],
+          str_detect(url, large_doms[4]) ~ !!large_doms[4],
+          str_detect(url, large_doms[5]) ~ !!large_doms[5],
+          str_detect(url, large_doms[6]) ~ !!large_doms[6],
+          str_detect(url, large_doms[7]) ~ !!large_doms[7],
+          str_detect(url, large_doms[8]) ~ !!large_doms[8],
+          str_detect(url, large_doms[9]) ~ !!large_doms[9],
+          str_detect(url, large_doms[10]) ~ !!large_doms[10],
+          str_detect(url, large_doms[11]) ~ !!large_doms[11],
+          str_detect(url, large_doms[12]) ~ !!large_doms[12],
+          str_detect(url, large_doms[13]) ~ !!large_doms[13],
+          str_detect(url, large_doms[14]) ~ !!large_doms[14],
+          str_detect(url, large_doms[15]) ~ !!large_doms[15],
+          str_detect(url, large_doms[16]) ~ !!large_doms[16],
+          str_detect(url, large_doms[17]) ~ !!large_doms[17],
+          str_detect(url, large_doms[18]) ~ !!large_doms[18],
+          str_detect(url, large_doms[19]) ~ !!large_doms[19],
+          TRUE ~ "other"
+        ),
+        is_large = if_else(large_domains == "other", "Other Domains", "Large Domains")
+    )
+
+  rm(db_words)
+
+  saveRDS(df_words, rds_words)
+}
+
+rm(rds_words)
+```
+
+```{r sql-data-https}
+rds_https <- here::here("proc_data", "sql_https.Rds")
+
+if(!file.exists(rds_https)) {
+
+  db_https <- tbl(con, "website") %>%
+    dplyr::select(https, url) %>%
+    collect()
+
+  df_https <-
+    db_https %>%
+    inner_join(df_pos) %>%
+    filter(!is.na(https)) %>%
+    mutate(
+        large_domains = case_when(
+          str_detect(url, large_doms[1]) ~ !!large_doms[1],
+          str_detect(url, large_doms[2]) ~ !!large_doms[2],
+          str_detect(url, large_doms[3]) ~ !!large_doms[3],
+          str_detect(url, large_doms[4]) ~ !!large_doms[4],
+          str_detect(url, large_doms[5]) ~ !!large_doms[5],
+          str_detect(url, large_doms[6]) ~ !!large_doms[6],
+          str_detect(url, large_doms[7]) ~ !!large_doms[7],
+          str_detect(url, large_doms[8]) ~ !!large_doms[8],
+          str_detect(url, large_doms[9]) ~ !!large_doms[9],
+          str_detect(url, large_doms[10]) ~ !!large_doms[10],
+          str_detect(url, large_doms[11]) ~ !!large_doms[11],
+          str_detect(url, large_doms[12]) ~ !!large_doms[12],
+          str_detect(url, large_doms[13]) ~ !!large_doms[13],
+          str_detect(url, large_doms[14]) ~ !!large_doms[14],
+          str_detect(url, large_doms[15]) ~ !!large_doms[15],
+          str_detect(url, large_doms[16]) ~ !!large_doms[16],
+          str_detect(url, large_doms[17]) ~ !!large_doms[17],
+          str_detect(url, large_doms[18]) ~ !!large_doms[18],
+          str_detect(url, large_doms[19]) ~ !!large_doms[19],
+          TRUE ~ "other"
+        ),
+        is_large = if_else(large_domains == "other", "Other Domains", "Large Domains")
+    )
+
+  rm(db_https)
+
+  saveRDS(df_https, rds_https)
+}
+
+rm(rds_https)
+```
+
+```{r sql-response-status}
+rds_broken <- here::here("proc_data", "sql_brokenlinks.Rds")
+
+if(!file.exists(rds_broken)) {
+
+  db_broken <- tbl(con, "website") %>%
+    dplyr::select(broken_links_amount_body, url) %>%
+    collect()
+
+  df_broken <-
+    db_broken %>%
+    inner_join(df_pos) %>%
+    filter(!is.na(broken_links_amount_body)) %>%
+    mutate(
+        large_domains = case_when(
+          str_detect(url, large_doms[1]) ~ !!large_doms[1],
+          str_detect(url, large_doms[2]) ~ !!large_doms[2],
+          str_detect(url, large_doms[3]) ~ !!large_doms[3],
+          str_detect(url, large_doms[4]) ~ !!large_doms[4],
+          str_detect(url, large_doms[5]) ~ !!large_doms[5],
+          str_detect(url, large_doms[6]) ~ !!large_doms[6],
+          str_detect(url, large_doms[7]) ~ !!large_doms[7],
+          str_detect(url, large_doms[8]) ~ !!large_doms[8],
+          str_detect(url, large_doms[9]) ~ !!large_doms[9],
+          str_detect(url, large_doms[10]) ~ !!large_doms[10],
+          str_detect(url, large_doms[11]) ~ !!large_doms[11],
+          str_detect(url, large_doms[12]) ~ !!large_doms[12],
+          str_detect(url, large_doms[13]) ~ !!large_doms[13],
+          str_detect(url, large_doms[14]) ~ !!large_doms[14],
+          str_detect(url, large_doms[15]) ~ !!large_doms[15],
+          str_detect(url, large_doms[16]) ~ !!large_doms[16],
+          str_detect(url, large_doms[17]) ~ !!large_doms[17],
+          str_detect(url, large_doms[18]) ~ !!large_doms[18],
+          str_detect(url, large_doms[19]) ~ !!large_doms[19],
+          TRUE ~ "other"
+        ),
+        is_large = if_else(large_domains == "other", "Other Domains", "Large Domains")
+    )
+
+  rm(db_broken)
+
+  saveRDS(df_broken, rds_broken)
+}
+
+rm(rds_broken)
+```
+
+```{r sql-images-body}
+rds_img <- here::here("proc_data", "sql_imagesbody.Rds")
+
+if(!file.exists(rds_img)) {
+
+  db_img <- tbl(con, "website") %>%
+    dplyr::select(images_amount_body, url) %>%
+    collect()
+
+  df_img <-
+    db_img %>%
+    inner_join(df_pos) %>%
+    filter(!is.na(images_amount_body)) %>%
+    mutate(
+        large_domains = case_when(
+          str_detect(url, large_doms[1]) ~ !!large_doms[1],
+          str_detect(url, large_doms[2]) ~ !!large_doms[2],
+          str_detect(url, large_doms[3]) ~ !!large_doms[3],
+          str_detect(url, large_doms[4]) ~ !!large_doms[4],
+          str_detect(url, large_doms[5]) ~ !!large_doms[5],
+          str_detect(url, large_doms[6]) ~ !!large_doms[6],
+          str_detect(url, large_doms[7]) ~ !!large_doms[7],
+          str_detect(url, large_doms[8]) ~ !!large_doms[8],
+          str_detect(url, large_doms[9]) ~ !!large_doms[9],
+          str_detect(url, large_doms[10]) ~ !!large_doms[10],
+          str_detect(url, large_doms[11]) ~ !!large_doms[11],
+          str_detect(url, large_doms[12]) ~ !!large_doms[12],
+          str_detect(url, large_doms[13]) ~ !!large_doms[13],
+          str_detect(url, large_doms[14]) ~ !!large_doms[14],
+          str_detect(url, large_doms[15]) ~ !!large_doms[15],
+          str_detect(url, large_doms[16]) ~ !!large_doms[16],
+          str_detect(url, large_doms[17]) ~ !!large_doms[17],
+          str_detect(url, large_doms[18]) ~ !!large_doms[18],
+          str_detect(url, large_doms[19]) ~ !!large_doms[19],
+          TRUE ~ "other"
+        ),
+        is_large = if_else(large_domains == "other", "Other Domains", "Large Domains")
+    )
+
+  rm(db_img)
+
+  saveRDS(df_img, rds_img)
+}
+
+rm(rds_img)
+```
+
+```{r sql-internal-links-body}
+rds_internal <- here::here("proc_data", "sql_internallinks.Rds")
+
+if(!file.exists(rds_internal)) {
+
+  db_internal <- tbl(con, "website") %>%
+    dplyr::select(unique_internal_links_amount_body, url) %>%
+    collect()
+
+  df_internal <-
+    db_internal %>%
+    inner_join(df_pos) %>%
+    filter(!is.na(unique_internal_links_amount_body)) %>%
+    mutate(
+        large_domains = case_when(
+          str_detect(url, large_doms[1]) ~ !!large_doms[1],
+          str_detect(url, large_doms[2]) ~ !!large_doms[2],
+          str_detect(url, large_doms[3]) ~ !!large_doms[3],
+          str_detect(url, large_doms[4]) ~ !!large_doms[4],
+          str_detect(url, large_doms[5]) ~ !!large_doms[5],
+          str_detect(url, large_doms[6]) ~ !!large_doms[6],
+          str_detect(url, large_doms[7]) ~ !!large_doms[7],
+          str_detect(url, large_doms[8]) ~ !!large_doms[8],
+          str_detect(url, large_doms[9]) ~ !!large_doms[9],
+          str_detect(url, large_doms[10]) ~ !!large_doms[10],
+          str_detect(url, large_doms[11]) ~ !!large_doms[11],
+          str_detect(url, large_doms[12]) ~ !!large_doms[12],
+          str_detect(url, large_doms[13]) ~ !!large_doms[13],
+          str_detect(url, large_doms[14]) ~ !!large_doms[14],
+          str_detect(url, large_doms[15]) ~ !!large_doms[15],
+          str_detect(url, large_doms[16]) ~ !!large_doms[16],
+          str_detect(url, large_doms[17]) ~ !!large_doms[17],
+          str_detect(url, large_doms[18]) ~ !!large_doms[18],
+          str_detect(url, large_doms[19]) ~ !!large_doms[19],
+          TRUE ~ "other"
+        ),
+        is_large = if_else(large_domains == "other", "Other Domains", "Large Domains")
+    )
+
+  rm(db_internal)
+
+  saveRDS(df_internal, rds_internal)
+}
+
+rm(rds_internal)
+```
+
+```{r sql-external-links-body}
+rds_external <- here::here("proc_data", "sql_externallinks.Rds")
+
+if(!file.exists(rds_external)) {
+
+  db_external <- tbl(con, "website") %>%
+    dplyr::select(unique_external_links_amount_body, url) %>%
+    collect()
+
+  df_external <-
+    db_external %>%
+    inner_join(df_pos) %>%
+    filter(!is.na(unique_external_links_amount_body)) %>%
+    mutate(
+        large_domains = case_when(
+          str_detect(url, large_doms[1]) ~ !!large_doms[1],
+          str_detect(url, large_doms[2]) ~ !!large_doms[2],
+          str_detect(url, large_doms[3]) ~ !!large_doms[3],
+          str_detect(url, large_doms[4]) ~ !!large_doms[4],
+          str_detect(url, large_doms[5]) ~ !!large_doms[5],
+          str_detect(url, large_doms[6]) ~ !!large_doms[6],
+          str_detect(url, large_doms[7]) ~ !!large_doms[7],
+          str_detect(url, large_doms[8]) ~ !!large_doms[8],
+          str_detect(url, large_doms[9]) ~ !!large_doms[9],
+          str_detect(url, large_doms[10]) ~ !!large_doms[10],
+          str_detect(url, large_doms[11]) ~ !!large_doms[11],
+          str_detect(url, large_doms[12]) ~ !!large_doms[12],
+          str_detect(url, large_doms[13]) ~ !!large_doms[13],
+          str_detect(url, large_doms[14]) ~ !!large_doms[14],
+          str_detect(url, large_doms[15]) ~ !!large_doms[15],
+          str_detect(url, large_doms[16]) ~ !!large_doms[16],
+          str_detect(url, large_doms[17]) ~ !!large_doms[17],
+          str_detect(url, large_doms[18]) ~ !!large_doms[18],
+          str_detect(url, large_doms[19]) ~ !!large_doms[19],
+          TRUE ~ "other"
+        ),
+        is_large = if_else(large_domains == "other", "Other Domains", "Large Domains")
+    )
+
+  rm(db_external)
+
+  saveRDS(df_external, rds_external)
+}
+
+rm(rds_external)
+```
+
+```{r sql-follow-links-body}
+rds_follow <- here::here("proc_data", "sql_followlinks.Rds")
+
+  if(!file.exists(rds_follow)) {
+
+  db_follow <- tbl(con, "website") %>%
+    dplyr::select(follow_links_amount_body, url) %>%
+    collect()
+
+  df_follow <-
+    db_follow %>%
+    inner_join(df_pos) %>%
+    filter(!is.na(follow_links_amount_body)) %>%
+    mutate(
+        large_domains = case_when(
+          str_detect(url, large_doms[1]) ~ !!large_doms[1],
+          str_detect(url, large_doms[2]) ~ !!large_doms[2],
+          str_detect(url, large_doms[3]) ~ !!large_doms[3],
+          str_detect(url, large_doms[4]) ~ !!large_doms[4],
+          str_detect(url, large_doms[5]) ~ !!large_doms[5],
+          str_detect(url, large_doms[6]) ~ !!large_doms[6],
+          str_detect(url, large_doms[7]) ~ !!large_doms[7],
+          str_detect(url, large_doms[8]) ~ !!large_doms[8],
+          str_detect(url, large_doms[9]) ~ !!large_doms[9],
+          str_detect(url, large_doms[10]) ~ !!large_doms[10],
+          str_detect(url, large_doms[11]) ~ !!large_doms[11],
+          str_detect(url, large_doms[12]) ~ !!large_doms[12],
+          str_detect(url, large_doms[13]) ~ !!large_doms[13],
+          str_detect(url, large_doms[14]) ~ !!large_doms[14],
+          str_detect(url, large_doms[15]) ~ !!large_doms[15],
+          str_detect(url, large_doms[16]) ~ !!large_doms[16],
+          str_detect(url, large_doms[17]) ~ !!large_doms[17],
+          str_detect(url, large_doms[18]) ~ !!large_doms[18],
+          str_detect(url, large_doms[19]) ~ !!large_doms[19],
+          TRUE ~ "other"
+        ),
+        is_large = if_else(large_domains == "other", "Other Domains", "Large Domains")
+    )
+
+  rm(db_follow)
+
+  saveRDS(df_follow, rds_follow)
+}
+
+rm(rds_follow)
+```
+
+
+
+*3 Content scope (small dataset)*
+
+```{r data-clearscope}
+df_scope <- readr::read_csv(here::here("raw_data", "clearscope_final", "backlink-clearscope-results.csv")) %>%
+  dplyr::select(-X7)
+```
+
+
+
+# 1 Introduction
+
+## 1.2 Cleaning the Data: What Information Do We Keep for Analysis?
+
+We have also a lot of large domains that we did not scrape. Like we did before, would be good to have a seperate trend line i.e. "All Pages" and "Large Domains" --> CED: Done (facets were the best choice for the interval stripes). If you prefer something else, let me know. Boxplots would work as well but they look messy when 10 * 2 boxplots are dodged.
+
+Please add analysis with and without outliers as in the previous project. --> CED: Still to do or interval stripes with different levels enough? Maybe some with only 50%/75% (as I did for example for url length)? Will write a note in the final report and we let Brian decide if he wants some intervals removed...(?)
+
+
+!!TODO CED: Plot of number of keywords/metrics per variable or position is boring and nonsense (all above 1.1 m). Decided to give an overview on missing alues but also this is odd (only a few). Will think about.
+
+```{r plot-overview-na, fig.width = 9, fig.height = 10.3}
+df_nas <-
+  df_ahrefs %>%
+  dplyr::select(position, Domain_rating, URL_rating, backlinks, refdomains) %>%
+  group_by(position) %>%
+  summarise_at(vars(Domain_rating:refdomains), list(~ sum(is.na(.)))) %>%
+  pivot_longer(
+    cols = Domain_rating:refdomains,
+    names_to = "variable",
+    values_to = "n"
+  ) %>%
+  mutate(variable = factor(variable,
+                           levels = c("Domain_rating", "URL_rating", "backlinks", "refdomains"),
+                           labels = c("Domain Rating", "URL Rating", "# Backlinks", "# Referring Domains")))
+
+df_nas %>%
+  ggplot(aes(position, n)) +
+    geom_col(aes(fill = position),
+             color = NA,
+             width = .63) +
+    geom_text(data = filter(df_nas, n > 0),
+              aes(position, n,
+                  label = n),
+              nudge_y = -.25,
+              family = "Montserrat ExtraBold",
+              fontface = "bold",
+              color = "white",
+              size = 3,
+              hjust = 1) +
+    geom_text(data = filter(df_nas, n == 0),
+              aes(position, n,
+                  label = "NO MISSING VALUES",
+                  color = position),
+              nudge_y = .15,
+              family = "Montserrat ExtraBold",
+              fontface = "bold",
+              #color = "black",
+              size = 2.7,
+              hjust = 0) +
+    facet_wrap(~ variable, scales = "free") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(0, 0),
+                       breaks = 0:7,
+                       limits = c(0, 7.3)) +
+    scale_color_gradient2(low = "#008556",
+                          mid = bl_col,
+                          high = "#79d8b6",
+                          midpoint = 5,
+                          guide = F) +
+    scale_fill_gradient2(low = "#008556",
+                         mid = bl_col,
+                         high = "#79d8b6",
+                         midpoint = 5,
+                         guide = F) +
+    labs(x = "POSITION", y = "NUMBER OF MISSING VALUES",
+         title = "SOME METRICS HAVE A FEW MISSING VALUES,\nBUT WITHOUT ANY CORRELATION TO POSITION.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "1_2_summary_na.png"), width = 9, height = 10.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "1_2_summary_na.pdf"), width = 9, height = 10.3, device = cairo_pdf)
+}
+```
+
+
+```{r summary-large-domains, fig.width = 9, fig.height = 7.1}
+df_ahrefs %>%
+  group_by(large_domains) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(
+    n_mod = if_else(n > 5*10^6, n - 9.1*10^6, as.double(n)),
+    large_domains = if_else(large_domains == "other", "Other Domains", large_domains),
+    large_domains = fct_reorder(large_domains, n_mod),
+    lab = if_else(n > 5*10^6, glue::glue("{round(n / 10^6, 2)}M"), glue::glue("{round(n / 1000, 1)}K"))
+  ) %>%
+  ggplot(aes(large_domains, n_mod,
+             fill = n_mod)) +
+    geom_col(width = .7) +
+    geom_hline(yintercept = 400000,
+               size = 7,
+               color = "white") +
+    geom_hline(yintercept = 400000,
+               size = .9,
+               color = "grey60",
+               linetype = "dashed") +
+    geom_text(aes(label = lab),
+              nudge_y = 3500,
+              family = "Montserrat ExtraBold",
+              fontface = "bold",
+              color = "grey40",
+              size = 2.7,
+              hjust = 0) +
+    coord_flip() +
+    scale_x_discrete(expand = c(.03, .03)) +
+    scale_y_continuous(expand = c(.015, .015),
+                       limits = c(0, 620000),
+                       breaks = c(seq(0, 600000, by = 100000)),
+                       labels = c("0", "100K", "200K", "300K", ". . .", "9.6M", "9.7M")) +
+    scale_fill_gradient2(high = "#008556",
+                         mid = bl_col,
+                         low = "#79d8b6",
+                         midpoint = 150000,
+                         guide = F) +
+    labs(x = NULL, y = "# UNIQUE URL'S",
+         title = "DOMAINS CLASSIFIED AS 'LARGE' CONTAIN ON AVERAGE 113K URL'S. WITH\n9.68M URL'S, THE NUMBER IS WAY HIGHER FOR 'OTHER' DOMAINS.") +
+    theme_flip +
+    theme(plot.title.position = "plot")
+
+if(save == T){
+  ggsave(here::here("plots", "1_2_summary_largedomains.png"), width = 9, height = 7.1, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "1_2_summary_largedomains.pdf"), width = 9, height = 7.1, device = cairo_pdf)
+}
+```
+
+
+
+# 2 Research Findings
+
+In this section, we analyse how different ranking factors relate with higher organic positions in the Search Engine Results Pages (SERPs).
+
+More specifiically, we look at following factors:
+
+* Domain Factors
+* Backlink Factors
+* Page-level Factors
+
+* Please also provide descriptive stats as well as model stats. Descriptive stats do no need to support the graph. It may contain findings that you consider noteworthy to include. Always support your statement with hard numbers!
+
+“The #1 organic result has 10x more X compared to a page in #10 spot.”
+“On average, moving up 1 spot in the search results (y) will require x more/less of [metric].
+
+
+
+## 2.1 Backlink Factors
+
+### 2.1.1 Backlinks (Ahrefs)
+
+#### -- incl. zeros
+
+```{r plot-backlinks-histogram-zeros, fig.width = 9, fig.height = 6.3}
+ggplot(df_ahrefs, aes(backlinks + 1)) +
+  geom_histogram(bins = 35, color = "#389977", fill = bl_col, size = .8) +
+  scale_x_log10(expand = c(.01, .01),
+                breaks = c(0, 10^1, 10^3, 10^5, 10^7) + 1,
+                labels = c("0", "10", "1K", "100K", "10M")) +
+  scale_y_continuous(expand = c(.02, .02),
+                     breaks = seq(0, 10^7, length.out = 5),
+                     labels = c("0", "2.5M", "5M", "7.5M", "10M")) +
+  labs(x = "# BACKLINKS", y = "COUNT",
+       title = "THE MAJORITY OF URL'S CONTAIN NO BACKLINKS AT ALL.")
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_1_histogram_backlinks_0s.png"), width = 9, height = 6.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_1_histogram_backlinks_0s.pdf"), width = 9, height = 6.3, device = cairo_pdf)
+}
+```
+
+```{r plot-backlinks-histogram-zeros-loglog, fig.width = 9, fig.height = 6.3}
+ggplot(df_ahrefs, aes(backlinks + 1)) +
+  geom_histogram(bins = 35, color = "#389977", fill = bl_col, size = .8) +
+  scale_x_log10(expand = c(.01, .01),
+                breaks = c(0, 10^1, 10^3, 10^5, 10^7) + 1,
+                labels = c("0", "10", "1K", "100K", "10M")) +
+  scale_y_log10(expand = c(.02, .02),
+                breaks = c(0, 10^1, 10^3, 10^5, 10^7),
+                labels = c("0", "10", "1K", "100K", "10M")) +
+  labs(x = "# BACKLINKS", y = "COUNT",
+       title = "THE MAJORITY OF URL'S CONTAIN NO BACKLINKS AT ALL.")
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_1_histogram_backlinks_0s_loglog.png"), width = 9, height = 6.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_1_histogram_backlinks_0s_loglog.pdf"), width = 9, height = 6.3, device = cairo_pdf)
+}
+```
+
+```{r plot-backlinks-histogram-zeros-loglog-position, fig.width = 9, fig.height = 18}
+# df_ahrefs %>%
+#   mutate(
+#     position = glue::glue("Position {position}"),
+#     position = factor(position, levels = glue::glue("Position {1:10}"))
+#   ) %>%
+#   ggplot(aes(backlinks + 1)) +
+#     geom_histogram(aes(fill = position),
+#                    binwidth = 500000,
+#                    color = "#389977", size = .8) +
+#     facet_grid(position ~ ., scales = "free_x") +
+#     scale_x_log10(expand = c(.01, .01)) +
+#      #              limits = c(0, 2*10^7),
+#     #               breaks = c(0, 10^1, 10^3, 10^5, 10^7) + 1,
+#     #               labels = c("0", "10", "1K", "100K", "10M")) +
+#     scale_y_log10(expand = c(.02, .02),
+#                   breaks = c(1, 100, 10000),
+#                   labels = c("1", "100", "10K")) +
+#     scale_fill_manual(values = pos_cols, guide = F) +
+#     labs(x = "# BACKLINKS", y = "COUNT",
+#          title = "THE MAJORITY OF URL'S CONTAIN NO BACKLINKS AT ALL.") +
+#     theme(strip.text.x = element_text(angle = 270, hjust = 0))
+#
+# if(save == T){
+#   ggsave(here::here("plots", "2_1_1_histogram_backlinks_facet_0s_loglog2.png"), width = 9, height = 18, dpi = dpi)
+#   ggsave(here::here("plots", "pdf", "2_1_1_histogram_backlinks_facet_0s_loglog.pdf"), width = 9, height = 18, device = cairo_pdf)
+# }
+```
+
+
+```{r plot-backlinks-pointinterval-zeros, fig.width = 9, fig.height = 6.2}
+df_ahrefs %>%
+  dplyr::select(position, backlinks) %>%
+  ggplot(aes(position, backlinks, color = position)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       breaks = seq(0, 30, by = 5)) +
+    scale_color_gradient2(low = "#008556",
+                          mid = bl_col,
+                          high = "#79d8b6",
+                          midpoint = 5,
+                          guide = F) +
+    labs(x = "POSITION", y = "# BACKLINKS",
+           title = "THE GENERAL PATTERN IS INDEPENDENT FROM POSITION:\nMOST URL'S DO NOT CONTAIN ANY BACKLINKS.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_1_pointint_backlinks_0s.png"), width = 9, height = 6.2, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_1_pointint_backlinks_0s.pdf"), width = 9, height = 6.2, device = cairo_pdf)
+}
+```
+
+
+```{r plot-backlinks-multiinterval-zeros, fig.width = 9, fig.height = 6.9}
+df_ahrefs %>%
+  dplyr::select(position, backlinks) %>%
+  ggplot(aes(position, backlinks, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       breaks = seq(0, 2*10^7, by = 5*10^6),
+                       labels = c("0", "5M", "10M", "15M", "20M")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "# BACKLINKS",
+           title = "MORE THAN 95% OF ALL URL'S DO NOT CONTAIN\nANY BACKLINKS, INDPENDENT FROM POSITION.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_1_multiint_backlinks_0s.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_1_multiint_backlinks_0s.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+##### Effect of Large Domains
+
+```{r plot-backlinks-multiinterval-large-domains-zeros, fig.width = 9, fig.height = 9.7}
+df_ahrefs %>%
+  dplyr::select(position, backlinks, is_large) %>%
+  ggplot(aes(position, backlinks, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    facet_wrap(~ is_large, nrow = 2, scales = "free_x") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.015, .015),
+                       labels = num_format) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "# BACKLINKS",
+           title = "LARGE DOMAINS CONTAIN MOSTLY A LOW NUMBER OF\nBACKLINKS WHILE OTHER DOMAINS INCLUDE UP TO 20 MILLION.\n(NOTE: SCALINGS OF THE X AXIS ARE NOT THE SAME!).") +
+    theme_flip +
+    theme(legend.position = "bottom",
+          legend.margin = margin(t = 10),
+          panel.spacing.x = unit(2, "lines"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_1_multiint_backlinks_facet_0s.png"), width = 9, height = 9.7, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_1_multiint_backlinks_facet_0s.pdf"), width = 9, height = 9.7, device = cairo_pdf)
+}
+```
+
+
+```{r plot-backlinks-multiinterval-large-domains-detail-zeros, fig.width = 9, fig.height = 7.6}
+df_large_domains <-
+  df_ahrefs %>%
+  dplyr::select(position, backlinks, large_domains) %>%
+  filter(large_domains != "other") %>%
+  group_by(large_domains) %>%
+  mutate(m = mean(backlinks, na.rm = T)) %>%
+  mutate(
+    is_lower = case_when(
+      backlinks < m ~ 1,
+      backlinks > m ~ 0,
+      backlinks == m ~ -1
+    )
+  ) %>%
+  summarize(
+    avg = unique(m),
+    min = min(backlinks, na.rm = T),
+    max = max(backlinks, na.rm = T),
+    p_below = mean(position[is_lower == 1], na.rm = T),
+    p_above = mean(position[is_lower == 0], na.rm = T)
+  ) %>%
+  mutate(
+    c_low = if_else(p_below > p_above, "lower", "higher"),
+    c_high = if_else(p_below < p_above, "lower", "higher"),
+    c_low = if_else(is.na(c_low), "lower", c_low),  ## doesn't matter, just to remove from legend
+    c_high = if_else(is.na(c_high), "lower", c_high)
+  ) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, avg))
+
+df_large_domains %>%
+  ggplot(aes(avg + 1, large_domains)) +
+    geom_segment(aes(x = avg + 1,
+                     xend = min + 1,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_low),
+                 size = 1.3) +
+    geom_segment(aes(x = avg + 1,
+                     xend = max + 1,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_high),
+                 size = 1.3) +
+    geom_point(size = 3) +
+    scale_y_discrete(expand = c(.03, .03)) +
+    scale_x_log10(expand = c(.03, .03),
+                  breaks = c(1, 10^1, 10^2, 10^3, 10^4, 10^5, 10^6),
+                  labels = c("1", "10", "100", "1K", "10K", "100K", "1M")) +
+    scale_color_manual(values = c(bl_col, "#8800d1"),
+                       name = "Average Position Below/Above the Metric's Average is...") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "# BACKLINKS", y = NULL,
+           title = "WIKIPEDIA COTAINS REMARKABLY MORE BACKLINKS THAN\nANY OTHER OF THE LARGE DOMAINS. IN MOST CASES, MORE\nBACKLINKS RESULT IN HIGHER POSITIONS ON AVERAGE.") +
+    theme_flip +
+    theme(plot.title.position = "plot",
+          legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.key.width = unit(14, "lines"),
+          legend.spacing.x = unit(0.75, "pt"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_1_segments_backlinks_largedoms_0s.png"), width = 9, height = 7.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_1_segments_backlinks_largedoms_0s.pdf"), width = 9, height = 7.9, device = cairo_pdf)
+}
+
+rm(df_large_domains)
+```
+
+
+#### -- excl. zeros (log scale)
+
+```{r plot-backlinks-pointinterval, fig.width = 9, fig.height = 6.5}
+df_ahrefs %>%
+  dplyr::select(position, backlinks) %>%
+  ggplot(aes(position, log2(backlinks), color = position)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       breaks = log2(c(0.1, 1, 10, 100, 1000, 10000)),
+                       labels = c("0.1", "1", "10", "100", "1K", "10K")) +
+    scale_color_gradient2(low = "#008556",
+                          mid = bl_col,
+                          high = "#79d8b6",
+                          midpoint = 5,
+                          guide = F) +
+    labs(x = "POSITION", y = "# BACKLINKS (EXCL. URL'S WITH ZERO BACKLINKS)",
+           title = "TOP RANKED URL'S CONTAIN MORE\nBACKLINKS THAN LOWER RANKED URL'S WHEN\nURL'S WITHOUT ANY BACKLINKS ARE EXCLUDED.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_1_pointint_backlinks.png"), width = 9, height = 6.5, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_1_pointint_backlinks.pdf"), width = 9, height = 6.5, device = cairo_pdf)
+}
+```
+
+
+```{r plot-backlinks-multiinterval, fig.width = 9, fig.height = 7.2}
+df_ahrefs %>%
+  dplyr::select(position, backlinks) %>%
+  ggplot(aes(position, log2(backlinks), group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       breaks = log2(c(0.1, 1, 10, 100, 1000, 10000, 1*10^5, 1*10^6, 1*10^7, 5*10^7)),
+                       labels = c("0.1", "1", "10", "100", "1K", "10K", "100K", "1M", "10M", "50M")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "# BACKLINKS (EXCL. URL'S WITH ZERO BACKLINKS)",
+           title = "URL'S RANKED ON POSITION 1 AND 2 CONTAIN APPROX. 3.8\nAND 2 TIMES MORE BACKLINKS THAN LOWER RANKED ONES\n(WHEN EXCLUDING URL'S WITHOUT ANY BACKLINKS).") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_1_multiint_backlinks.png"), width = 9, height = 7.2, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_1_multiint_backlinks.pdf"), width = 9, height = 7.2, device = cairo_pdf)
+}
+```
+
+
+##### Effect of Large Domains
+
+```{r plot-backlinks-multiinterval-large-domains, fig.width = 9, fig.height = 6.9}
+df_ahrefs %>%
+  dplyr::select(position, backlinks, is_large) %>%
+  ggplot(aes(position, log2(backlinks), group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       breaks = log2(c(0.1, 1, 10, 100, 1000, 10000, 1*10^5, 1*10^6, 1*10^7, 5*10^7)),
+                       labels = c("0.1", "1", "10", "100", "1K", "10K", "100K", "1M", "10M", "50M")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "# BACKLINKS (EXCL. URL'S WITH ZERO BACKLINKS)",
+           title = "LARGE DOMAINS CONTAIN CONSIDERABLY MORE BACKLINKS\nTHAN URL'S OF OTHER DOMAINS (MEDIAN OF 170 VS 5)\nWHEN ONLY URL'S WITH ANY BACKLINKS ARE INCLUDED.") +
+    theme_flip +
+    theme(legend.position = "bottom",
+          legend.margin = margin(t = 10),
+          panel.spacing.x = unit(2, "lines"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_1_multiint_backlinks_facet.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_1_multiint_backlinks_facet.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+```{r plot-backlinks-multiinterval-large-domains-detail, fig.width = 9, fig.height = 7.6}
+df_large_domains <-
+  df_ahrefs %>%
+  dplyr::select(position, backlinks, large_domains) %>%
+  filter(
+    backlinks > 0,
+    large_domains != "other"
+  ) %>%
+  group_by(large_domains) %>%
+  mutate(m = mean(backlinks, na.rm = T)) %>%
+  mutate(
+    is_lower = case_when(
+      backlinks < m ~ 1,
+      backlinks > m ~ 0,
+      backlinks == m ~ -1
+    )
+  ) %>%
+  summarize(
+    avg = unique(m),
+    min = min(backlinks, na.rm = T),
+    max = max(backlinks, na.rm = T),
+    p_below = mean(position[is_lower == 1], na.rm = T),
+    p_above = mean(position[is_lower == 0], na.rm = T)
+  ) %>%
+  mutate(
+    c_low = if_else(p_below > p_above, "lower", "higher"),
+    c_high = if_else(p_below < p_above, "lower", "higher"),
+    c_low = if_else(is.na(c_low), "lower", c_low),  ## doesn't matter, just to remove from legend
+    c_high = if_else(is.na(c_high), "lower", c_high)
+  ) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, avg))
+
+df_large_domains %>%
+  ggplot(aes(avg, large_domains)) +
+    geom_segment(aes(x = avg,
+                     xend = min,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_low),
+                 size = 1.3) +
+    geom_segment(aes(x = avg,
+                     xend = max,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_high),
+                 size = 1.3) +
+    geom_point(size = 3) +
+    scale_y_discrete(expand = c(.03, .03)) +
+    scale_x_log10(expand = c(.01, .01),
+                  breaks = c(1, 10^1, 10^2, 10^3, 10^4, 10^5, 10^6),
+                  labels = c("1", "10", "100", "1K", "10K", "100K", "1M")) +
+    scale_color_manual(values = c(bl_col, "#8800d1"),
+                       name = "Average Position Below/Above the Metric's Average is...") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "# BACKLINKS (EXCL. URL'S WITH ZERO BACKLINKS)", y = NULL,
+           title = "DOMAINS SUCH AS WIKIPEDIA, FACEBOOK & INSTAGRAM CONTAIN\nMANY MORE BACKLINKS, ESPECIALLY THAN EBAY, LINKEDIN &\nMAPQUEST (WHEN EXCLUDING URL'S WITH ZERO BACKLINKS).") +
+    theme_flip +
+    theme(plot.title.position = "plot",
+          legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.key.width = unit(14, "lines"),
+          legend.spacing.x = unit(0.75, "pt"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_1_segments_backlinks_largedoms.png"), width = 9, height = 7.6, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_1_segments_backlinks_largedoms.pdf"), width = 9, height = 7.6, device = cairo_pdf)
+}
+
+rm(df_large_domains)
+```
+
+
+
+### 2.1.2 Referring Domains (Ahrefs)
+
+#### -- incl. zeros
+
+```{r plot-refdomains-histogram-zeros, fig.width = 9, fig.height = 6.3}
+ggplot(df_ahrefs, aes(backlinks + 1)) +
+  geom_histogram(bins = 35, color = "#389977", fill = bl_col, size = .8) +
+  scale_x_log10(expand = c(.01, .01),
+                breaks = c(0, 10^1, 10^3, 10^5, 10^7) + 1,
+                labels = c("0", "10", "1K", "100K", "10M")) +
+  scale_y_continuous(expand = c(.02, .02),
+                     breaks = seq(0, 10^7, length.out = 5),
+                     labels = c("0", "2.5M", "5M", "7.5M", "10M")) +
+  labs(x = "# REFERRING DOMAINS", y = "COUNT",
+       title = "ALMOST ALL URL'S DO NOT CONTAIN ANY REFERRING DOMAINS.")
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_2_histogram_refdomains_0s.png"), width = 9, height = 6.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_2_histogram_refdomains_0s.pdf"), width = 9, height = 6.3, device = cairo_pdf)
+}
+```
+
+```{r plot-refdomains-histogram-zeros-loglog, fig.width = 9, fig.height = 6.3}
+ggplot(df_ahrefs, aes(backlinks + 1)) +
+  geom_histogram(bins = 35, color = "#389977", fill = bl_col, size = .8) +
+  scale_x_log10(expand = c(.01, .01),
+                breaks = c(0, 10^1, 10^3, 10^5, 10^7) + 1,
+                labels = c("0", "10", "1K", "100K", "10M")) +
+  scale_y_log10(expand = c(.02, .02),
+                breaks = c(0, 10^1, 10^3, 10^5, 10^7) + 1,
+                labels = c("0", "10", "1K", "100K", "10M")) +
+  labs(x = "# REFERRING DOMAINS", y = "COUNT",
+       title = "ALMOST ALL URL'S DO NOT CONTAIN ANY REFERRING DOMAINS.")
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_2_histogram_refdomains_0s_loglog.png"), width = 9, height = 6.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_2_histogram_refdomains_0s_loglog.pdf"), width = 9, height = 6.3, device = cairo_pdf)
+}
+```
+
+
+```{r plot-refdomains-pointinterval-zeros, fig.width = 9, fig.height = 6.2}
+df_ahrefs %>%
+  dplyr::select(position, refdomains) %>%
+  ggplot(aes(position, refdomains, color = position)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       labels = num_format) +
+      scale_color_gradient2(low = "#008556",
+                          mid = bl_col,
+                          high = "#79d8b6",
+                          midpoint = 5,
+                          guide = F) +
+    labs(x = "POSITION", y = "# REFERRING DOMAINS",
+           title = "THE GENERAL PATTERN IS INDEPENDENT FROM POSITION: THE\nMAJORITY OF URL'S DO NOT CONTAIN ANY REFERRING DOMAINS.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_2_pointint_refdomains_0s.png"), width = 9, height = 6.2, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_2_pointint_refdomains_0s.pdf"), width = 9, height = 6.2, device = cairo_pdf)
+}
+```
+
+
+```{r plot-refdomains-multiinterval-zeros, fig.width = 9, fig.height = 6.9}
+df_ahrefs %>%
+  dplyr::select(position, refdomains) %>%
+  ggplot(aes(position, refdomains, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       labels = num_format) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "# REFERRING DOMAINS",
+           title = "THE NUMBER OF REFERRING DOMAINS SHOW THE SAME\nPATTERN AS BACKLINKS (> 95% WITH NO REF. DOMAINS).") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_2_multiint_refdomains_0s.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_2_multiint_refdomains_0s.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+
+##### Effect of Large Domains
+
+```{r plot-refdomains-multiinterval-large-domains-zeros, fig.width = 9, fig.height = 6.9}
+df_ahrefs %>%
+  dplyr::select(position, refdomains, is_large) %>%
+  ggplot(aes(position, refdomains, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       labels = num_format) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "# REFERRING DOMAINS",
+           title = "LARGE DOMAINS CONTAIN SOMETIMES MORE THAN 10,000\nREFERRING DOMAINS BUT MOST DO NOT CONTAIN ANY AT ALL.") +
+    theme_flip +
+    theme(legend.position = "bottom",
+          legend.margin = margin(t = 10),
+          panel.spacing.x = unit(2, "lines"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_2_multiint_refdomains_facet_0s.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_2_multiint_refdomains_facet_0s.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+
+## summary stats
+avg <-
+  df_ahrefs %>%
+  dplyr::select(position, refdomains, is_large) %>%
+  group_by(is_large) %>%
+  summarize(avg = round(mean(refdomains, na.rm = T), 3)) %>%
+  pull(avg)
+
+max <-
+  df_ahrefs %>%
+  dplyr::select(position, refdomains, is_large) %>%
+  group_by(is_large) %>%
+  summarize(max = max(refdomains, na.rm = T)) %>%
+  pull(max)
+```
+
+
+```{r plot-refdomains-multiinterval-large-domains-detail-zeros, fig.width = 9, fig.height = 7.6}
+df_large_domains <-
+  df_ahrefs %>%
+  dplyr::select(position, refdomains, large_domains) %>%
+  filter(large_domains != "other") %>%
+  group_by(large_domains) %>%
+  mutate(m = mean(refdomains, na.rm = T)) %>%
+  mutate(
+    is_lower = case_when(
+      refdomains < m ~ 1,
+      refdomains > m ~ 0,
+      refdomains == m ~ -1
+    )
+  ) %>%
+  summarize(
+    avg = unique(m),
+    min = min(refdomains, na.rm = T),
+    max = max(refdomains, na.rm = T),
+    p_below = mean(position[is_lower == 1], na.rm = T),
+    p_above = mean(position[is_lower == 0], na.rm = T)
+  ) %>%
+  mutate(
+    c_low = if_else(p_below > p_above, "lower", "higher"),
+    c_high = if_else(p_below < p_above, "lower", "higher"),
+    c_low = if_else(is.na(c_low), "lower", c_low),  ## doesn't matter, just to remove from legend
+    c_high = if_else(is.na(c_high), "lower", c_high)
+  ) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, avg))
+
+df_large_domains %>%
+  ggplot(aes(avg + 1, large_domains)) +
+    geom_segment(aes(x = avg + 1,
+                     xend = min + 1,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_low),
+                 size = 1.3) +
+    geom_segment(aes(x = avg + 1,
+                     xend = max + 1,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_high),
+                 size = 1.3) +
+    geom_point(size = 3) +
+    scale_y_discrete(expand = c(.03, .03)) +
+    scale_x_log10(expand = c(.03, .03),
+                  breaks = c(1, 10^1 + 1, 10^2 + 1, 10^3 + 1, 10^4 + 1, 10^5 + 1),
+                  labels = c("0", "10", "100", "1K", "10K", "100K")) +
+    scale_color_manual(values = c(bl_col, "#8800d1"),
+                       name = "Average Position Below/Above the Metric's Average is...") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "# REFERRING DOMAINS", y = NULL,
+           title = "WIKIPEDIA CONTAINS ON AVERAGE 6.6 REFERRING DOMAINS, WHILE\nMOST OTHER LARGE DOMAINS CONTAIN (CLOSE) TO NONE. IN MOST\nCASES MORE REFERRING DOMAINS EQUALS HIGHER AVERAGE RANKING.") +
+    theme_flip +
+    theme(plot.title.position = "plot",
+          legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.key.width = unit(14, "lines"),
+          legend.spacing.x = unit(0.75, "pt"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_2_segments_refdomains_largedoms_0s.png"), width = 9, height = 7.6, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_2_segments_refdomains_largedoms_0s.pdf"), width = 9, height = 7.6, device = cairo_pdf)
+}
+
+rm(df_large_domains)
+```
+
+
+#### -- excl. zeros (log scale)
+
+```{r plot-refdomains-pointinterval, fig.width = 9, fig.height = 6.5}
+df_ahrefs %>%
+  dplyr::select(position, refdomains) %>%
+  ggplot(aes(position, log2(refdomains), color = position)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       breaks = log2(c(0.1, 1, 10, 100, 1000, 5000)),
+                       labels = c("0.1", "1", "10", "100", "1K", "5K")) +
+      scale_color_gradient2(low = "#008556",
+                          mid = bl_col,
+                          high = "#79d8b6",
+                          midpoint = 5,
+                          guide = F) +
+    labs(x = "POSITION", y = "# REFERRING DOMAINS (EXCL. URL'S WITH ZERO REF. DOMAINS)",
+           title = "TOP RANKED URLS CONTAIN MORE REFERRING\nDOMAINS THAN THOSE THAT ARE RANKED LOWER\n(WHEN EXCLUDING URL'S WITHOUT ANY REF. DOMAINS).") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_2_pointint_refdomains.png"), width = 9, height = 6.5, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_2_pointint_refdomains.pdf"), width = 9, height = 6.5, device = cairo_pdf)
+}
+```
+
+
+```{r plot-refdomains-multiinterval, fig.width = 9, fig.height = 7.2}
+df_ahrefs %>%
+  dplyr::select(position, refdomains) %>%
+  ggplot(aes(position, log2(refdomains), group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       breaks = log2(c(0.1, 1, 10, 100, 1000, 5000)),
+                       labels = c("0.1", "1", "10", "100", "1K", "5K")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "# REFERRING DOMAINS (EXCL. URL'S WITH ZERO REF. DOMAINS)",
+           title = "URL'S RANKED ON POSITION 1 AND 2 CONTAIN AROUND 3.2 AND\n2 TIMES MORE REFERRING DOMAINS THAN LOWER RANKED URL'S\n(WHEN URL'S WITHOUT ANY REF. DOMAINS ARE EXCLUDED).") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_2_multiint_refdomains.png"), width = 9, height = 7.2, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_2_multiint_refdomains.pdf"), width = 9, height = 7.2, device = cairo_pdf)
+}
+```
+
+
+
+##### Effect of Large Domains
+
+```{r plot-refdomains-multiinterval-large-domains, fig.width = 9, fig.height = 6.9}
+df_ahrefs %>%
+  dplyr::select(position, refdomains, is_large) %>%
+  ggplot(aes(position, log2(refdomains), group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       breaks = log2(c(0.1, 1, 10, 100, 1000, 5000)),
+                       labels = c("0.1", "1", "10", "100", "1K", "5K")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "# REFERRING DOMAINS (EXCL. URL'S WITH ZERO REF. DOMAINS)",
+           title = "LARGE DOMAINS CONTAIN CONSIDERABLY MORE\nREFERRING DOMAINS THAN OTHER URL'S (MEDIAN OF 62 VS 3)\n(WHEN URL'S WITHOUT ANY REF. DOMAINS ARE EXCLUDED).") +
+    theme_flip +
+    theme(legend.position = "bottom",
+          legend.margin = margin(t = 10),
+          panel.spacing.x = unit(2, "lines"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_2_multiint_refdomains_facet.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_2_multiint_refdomains_facet.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+```{r plot-refdomains-multiinterval-large-domains-detail, fig.width = 9, fig.height = 7.6}
+df_large_domains <-
+  df_ahrefs %>%
+  dplyr::select(position, refdomains, large_domains) %>%
+  filter(
+    refdomains > 0,
+    large_domains != "other"
+  ) %>%
+  group_by(large_domains) %>%
+  mutate(m = mean(refdomains, na.rm = T)) %>%
+  mutate(
+    is_lower = case_when(
+      refdomains < m ~ 1,
+      refdomains > m ~ 0,
+      refdomains == m ~ -1
+    )
+  ) %>%
+  summarize(
+    avg = unique(m),
+    min = min(refdomains, na.rm = T),
+    max = max(refdomains, na.rm = T),
+    p_below = mean(position[is_lower == 1], na.rm = T),
+    p_above = mean(position[is_lower == 0], na.rm = T)
+  ) %>%
+  mutate(
+    c_low = if_else(p_below > p_above, "lower", "higher"),
+    c_high = if_else(p_below < p_above, "lower", "higher"),
+    c_low = if_else(is.na(c_low), "lower", c_low),  ## doesn't matter, just to remove from legend
+    c_high = if_else(is.na(c_high), "lower", c_high)
+  ) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, avg))
+
+df_large_domains %>%
+  ggplot(aes(avg, large_domains)) +
+    geom_segment(aes(x = avg,
+                     xend = min,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_low),
+                 size = 1.3) +
+    geom_segment(aes(x = avg,
+                     xend = max,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_high),
+                 size = 1.3) +
+    geom_point(size = 3) +
+    scale_y_discrete(expand = c(.03, .03)) +
+    scale_x_log10(expand = c(.01, .01),
+                  breaks = c(1, 10^1, 10^2, 10^3, 10^4, 10^5, 10^6),
+                  labels = c("1", "10", "100", "1K", "10K", "100K", "1M")) +
+    scale_color_manual(values = c(bl_col, "#8800d1"),
+                       name = "Average Position Below/Above the Metric's Average is...") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "# REFERRING DOMAINS (EXCL. URL'S WITH ZERO REF. DOMAINS)", y = NULL,
+           title = "URL'S FROM WIKIPEDIA CONTAIN ON AVERAGE 216 REFERRING\nDOMAINS, MANY MORE THAN THE OTHER LARGE DOMAINS\n(WHEN EXCLUDING URL'S WITH ZERO REF. DOMAINS).") +
+    theme_flip +
+    theme(plot.title.position = "plot",
+          legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.key.width = unit(14, "lines"),
+          legend.spacing.x = unit(0.75, "pt"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_2_segments_refdomains_largedoms.png"), width = 9, height = 7.6, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_2_segments_refdomains_largedoms.pdf"), width = 9, height = 7.6, device = cairo_pdf)
+}
+
+rm(df_large_domains)
+```
+
+
+### 2.1.3 Schema.org Usage (MySQL)
+
+```{r data-2-1-3}
+df_schema <- readRDS(here::here("proc_data", "sql_schema.Rds"))
+```
+
+
+```{r plot-schema-bars, fig.width = 9, fig.height = 6.5}
+df_schema %>%
+  group_by(position) %>%
+  mutate(sum = n()) %>%
+  group_by(position, schema_markup_exists) %>%
+  summarize(perc = n() / unique(sum)) %>%
+  mutate(perc = if_else(schema_markup_exists == 0, -perc, perc)) %>%
+  ggplot(aes(position, perc, color = schema_markup_exists > 0)) +
+    geom_segment(aes(xend = position, yend = 0),
+                 size = 7) +
+    #geom_point(size = 5) +
+    geom_hline(yintercept = 0,
+               color = "grey70",
+               size = 1.2) +
+    # geom_smooth(
+    #   method = "lm",
+    #   se = FALSE,
+    #   formula = y ~ x + I(x^2) + I(x^3),
+    #   color = "black"
+    # ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       limits = c(-1, 1),
+                       breaks = c(-1, -.5, 0, .5, 1),
+                       labels = c("100% No", "50% No", "Baseline", "50% Yes", "100% Yes")) +
+    scale_color_manual(values = c("#8800d1", bl_col), guide = F) +
+    labs(x = "POSITION", y = "DOES SCHEMA MARKUP EXIST?",
+           title = "MOST URL'S, INDEPENDENT FROM POSITION, DO NOT COME\nWITH SCHEMA MARKUP. URL'S ON POSITION 1 AND 2 HAVE\nIT SLIGHTLY LESS OFTEN COMPARED TO LOWER POSITIONS.") +
+    theme_flip +
+    theme(panel.grid.minor.x = element_line(size = .3,
+                                            color = "#eaeaea"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_3_bars_schema.png"), width = 9, height = 6.5, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_3_bars_schema.pdf"), width = 9, height = 6.5, device = cairo_pdf)
+}
+```
+
+
+##### Effect of Large Domains
+
+```{r plot-schema-bars-large-domains, fig.width = 9, fig.height = 6.2}
+df_schema %>%
+  group_by(position, is_large) %>%
+  mutate(sum = n()) %>%
+  group_by(position, is_large, schema_markup_exists) %>%
+  summarize(perc = n() / unique(sum)) %>%
+  mutate(perc = if_else(schema_markup_exists == 0, -perc, perc)) %>%
+  ggplot(aes(position, perc, color = schema_markup_exists > 0)) +
+    geom_segment(aes(xend = position, yend = 0),
+                 size = 7) +
+    #geom_point(size = 4) +
+    geom_hline(yintercept = 0,
+               color = "grey70",
+               size = 1.2) +
+    # geom_smooth(
+    #   method = "lm",
+    #   se = FALSE,
+    #   formula = y ~ x + I(x^2) + I(x^3),
+    #   color = "black"
+    # ) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       limits = c(-1, 1),
+                       breaks = c(-1, 0, 1),
+                       labels = c("100% No", "Baseline", "100% Yes")) +
+    scale_color_manual(values = c("#8800d1", bl_col), guide = F) +
+    labs(x = "POSITION", y = "DOES SCHEMA MARKUP EXIST?",
+           title = "LARGE DOMAINS COME LESS OFTEN WITH\nSCHEMA MARKUP THAN OTHER DOMAINS.") +
+    theme_flip +
+    theme(panel.grid.minor.x = element_line(size = .3,
+                                            color = "#eaeaea"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_3_bars_schema_facet.png"), width = 9, height = 6.2, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_3_bars_schema_facet.pdf"), width = 9, height = 6.2, device = cairo_pdf)
+}
+```
+
+
+```{r plot-schema-bars-large-domains-detail, fig.width = 9, fig.height = 6.5}
+df_schema %>%
+  filter(large_domains != "other") %>%
+  group_by(large_domains) %>%
+  mutate(sum = n()) %>%
+  group_by(large_domains, schema_markup_exists) %>%
+  summarize(perc = n() / unique(sum)) %>%
+  mutate(perc = if_else(schema_markup_exists == 0, -perc, perc)) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, perc)) %>%
+  ggplot(aes(large_domains, perc, color = schema_markup_exists > 0)) +
+    geom_segment(aes(xend = large_domains, yend = 0),
+                 size = 4.5) +
+    #geom_point(size = 4) +
+    geom_hline(yintercept = 0,
+               color = "grey70",
+               size = 1.2) +
+    coord_flip() +
+    scale_x_discrete(expand = c(.02, .02)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       limits = c(-1, 1),
+                       breaks = c(-1, -.5, 0, .5, 1),
+                       labels = c("100% No", "50% No", "Baseline", "50% Yes", "100% Yes")) +
+    scale_color_manual(values = c("#8800d1", bl_col), guide = F) +
+    labs(x = "POSITION", y = "DOES SCHEMA MARKUP EXIST?",
+           title = "THE USE OF SCHEMA MARKUP BY LARGE DOMAINS IS\nHIGHLY SKEWED: TARGET.COM USES IT BY FAR MORE\nOFTEN THAN OTHERS, WHILE MANY DOMAINS RARELY\nOR NEVER COME WITH SCHEMA MARKUP.") +
+    theme_flip +
+    theme(panel.grid.minor.x = element_line(size = .3,
+                                            color = "#eaeaea"),
+          plot.title.position = "plot")
+
+if(save == T){
+  ggsave(here::here("plots", "2_1_3_bars_schema_largedoms.png"), width = 9, height = 7.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_1_3_bars_schema_largedoms.pdf"), width = 9, height = 7.9, device = cairo_pdf)
+}
+```
+
+
+```{r rm-data-2-1-3}
+rm(df_schema)
+```
+
+
+
+## 2.2 Domain Factors
+
+
+### 2.2.1 Domain Rating (Ahrefs)
+
+```{r plot-domainrating-histogram, fig.width = 9, fig.height = 6.3}
+ggplot(df_ahrefs, aes(Domain_rating)) +
+  geom_histogram(bins = 35, color = "#389977", fill = bl_col, size = .8) +
+  scale_x_continuous(expand = c(.01, .01),
+                       breaks = seq(0, 100, by = 20)) +
+  scale_y_continuous(expand = c(.02, .02),
+                     breaks = seq(0, 1.75*10^6, length.out = 8),
+                     labels = c("0", "250K", "500K", "750K", "1M", "1.25M", "1.5M", "1.75M")) +
+  labs(x = "DOMAIN RATING", y = "COUNT",
+       title = "HALF OF ALL URL'S SCORE 80 OR MORE IN DOMAIN RATING.")
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_1_histogram_domrating.png"), width = 9, height = 6.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_1_histogram_domrating.pdf"), width = 9, height = 6.3, device = cairo_pdf)
+}
+```
+
+
+```{r plot-domainrating-pointinterval, fig.width = 9, fig.height = 6.2}
+df_ahrefs %>%
+  dplyr::select(position, Domain_rating) %>%
+  #median_qi(Domain_rating) %>%
+  ggplot(aes(position, Domain_rating, color = position)) +
+    #geom_pointintervalh(aes(xmin = .lower, xmax = .upper)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       breaks = seq(0, 100, by = 20)) +
+    scale_color_gradient2(low = "#008556",
+                          mid = bl_col,
+                          high = "#79d8b6",
+                          midpoint = 5,
+                          guide = F) +
+    labs(x = "POSITION", y = "DOMAIN RATING",
+           title = "TOP RANKED URL'S HAVE ON SLIGHTLY\nHIGHER DOMAIN RATINGS AND RANGES ON AVERAGE.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_1_pointint_domrating.png"), width = 9, height = 6.2, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_1_pointint_domrating.pdf"), width = 9, height = 6.2, device = cairo_pdf)
+}
+```
+
+
+```{r plot-domainrating-multiinterval, fig.width = 9, fig.height = 6.9}
+df_ahrefs %>%
+  dplyr::select(position, Domain_rating) %>%
+  ggplot(aes(position, Domain_rating, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       breaks = seq(0, 100, by = 20)) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "DOMAIN RATING",
+           title = "AVERAGE DOMAIN RATING INCREASES WITH POSITION,\nWITH POSITION 2 HAVING THE HIGHEST RATING OVERALL.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_1_multiint_domrating.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_1_multiint_domrating.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+#### Effect of Large Domains
+
+```{r plot-domainrating-multiinterval-large-domains, fig.width = 9, fig.height = 6.9}
+df_ahrefs %>%
+  dplyr::select(position, Domain_rating, is_large) %>%
+  ggplot(aes(position, Domain_rating, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.01, .01),
+                       breaks = seq(0, 100, by = 20)) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "DOMAIN RATING",
+           title = "LARGE DOMAINS HAVE REMARKABLY HIGHER DOMAIN RATINGS\nCOMPARED TO ALL OTHER DOMAINS (AVERAGE OF 95.5 VS 66.4).") +
+    theme_flip +
+    theme(legend.position = "bottom",
+          legend.margin = margin(t = 10),
+          panel.spacing.x = unit(2, "lines"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_1_multiint_domrating_facet.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_1_multiint_domrating_facet.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+```{r plot-domainrating-multiinterval-large-domains-detail-zeros, fig.width = 9, fig.height = 7.6}
+df_large_domains <-
+  df_ahrefs %>%
+  dplyr::select(position, Domain_rating, large_domains) %>%
+  filter(large_domains != "other") %>%
+  group_by(large_domains) %>%
+  mutate(m = mean(Domain_rating, na.rm = T)) %>%
+  mutate(
+    is_lower = case_when(
+      Domain_rating < m ~ 1,
+      Domain_rating > m ~ 0,
+      Domain_rating == m ~ -1
+    )
+  ) %>%
+  summarize(
+    avg = unique(m),
+    min = min(Domain_rating, na.rm = T),
+    max = max(Domain_rating, na.rm = T),
+    p_below = mean(position[is_lower == 1], na.rm = T),
+    p_above = mean(position[is_lower == 0], na.rm = T)
+  ) %>%
+  mutate(
+    c_low = if_else(p_below > p_above, "lower", "higher"),
+    c_high = if_else(p_below < p_above, "lower", "higher"),
+    c_low = if_else(is.na(c_low), "lower", c_low),  ## doesn't matter, just to remove from legend
+    c_high = if_else(is.na(c_high), "lower", c_high)
+  ) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, avg))
+
+df_large_domains %>%
+  ggplot(aes(avg, large_domains)) +
+    geom_segment(aes(x = avg,
+                     xend = min,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_low),
+                 size = 1.3) +
+    geom_segment(aes(x = avg,
+                     xend = max,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_high),
+                 size = 1.3) +
+    geom_point(size = 3) +
+    scale_y_discrete(expand = c(.03, .03)) +
+    scale_x_continuous(expand = c(.03, .03),
+                       breaks = seq(0, 100, by = 20)) +
+    scale_color_manual(values = c(bl_col, "#8800d1"),
+                       name = "Average Position Below/Above the Metric's Average is...") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "DOMAIN RATING", y = NULL,
+           title = "FACEBOOK HAS AN AVERAGE DOMAIN RATING OF 100, CLOSELY\nFOLLOWED BY THE OTHER SOCIAL MEDIA PLATTFORMS. WIKIPEDIA &\nAMAZON SCORE 95, YELLOWPAGES WITH 90% THE LOWEST SCORE.") +
+    theme_flip +
+    theme(plot.title.position = "plot",
+          legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.key.width = unit(14, "lines"),
+          legend.spacing.x = unit(0.75, "pt"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_1_segments_domrating_largedoms.png"), width = 9, height = 7.6, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_1_segments_domrating_largedoms.pdf"), width = 9, height = 7.6, device = cairo_pdf)
+}
+
+rm(df_large_domains)
+```
+
+
+### 2.2.2 Page Speed (MySQL)
+
+```{r data-2-2-2}
+df_speed <- readRDS(here::here("proc_data", "sql_pagespeed.Rds"))
+```
+
+
+```{r plot-pagespeed-histogram, fig.width = 9, fig.height = 6.3}
+ggplot(df_speed, aes(alexa_speed_msec + 1)) +
+  geom_histogram(bins = 35, color = "#389977", fill = bl_col, size = .8) +
+  scale_x_log10(expand = c(.01, .01),
+                breaks = c(0, 10^1, 10^2, 10^3, 10^4, 10^5, 10^6) + 1,
+                labels = c("1", "10", "100", "1K", "10K", "100K", "1M")) +
+  scale_y_continuous(expand = c(.02, .02),
+                     breaks = seq(0, 2*10^6, length.out = 5),
+                     labels = c("0", "50K", "100K", "150K", "200K")) +
+  labs(x = "ALEXA PAGE SPEED (MSEC)", y = "COUNT",
+       title = "MOST URL'S HAVE A PAGE SPEED OF AROUND 10.4 SECONDS.")
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_2_histogram_speed.png"), width = 9, height = 6.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_2_histogram_speed.pdf"), width = 9, height = 6.3, device = cairo_pdf)
+}
+```
+
+
+```{r plot-pagespeed-pointinterval, fig.width = 9, fig.height = 6.2}
+df_speed %>%
+  dplyr::select(position, alexa_speed_msec) %>%
+  ggplot(aes(position, alexa_speed_msec, color = position)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       breaks = seq(1000, 12000, by = 2000),
+                       labels = glue::glue("{seq(1, 12, by = 2)}K")) +
+    scale_color_gradient2(low = "#008556",
+                          mid = bl_col,
+                          high = "#79d8b6",
+                          midpoint = 5,
+                          guide = F) +
+    labs(x = "POSITION", y = "ALEXA PAGE SPEED (MSEC)",
+           title = "PAGE SPEED IS, INDEPENDENT FROM POSITION, AROUND\n1,650 MILLISECONDS BUT SOME ARE REMARKABLY SLOWER,\nESPECIALLY ON HIGH RANKED POSITIONS.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_2_pointint_speed.png"), width = 9, height = 5.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_2_pointint_speed.pdf"), width = 9, height = 5.9, device = cairo_pdf)
+}
+```
+
+
+```{r plot-pagespeed-multiinterval, fig.width = 9, fig.height = 6.9}
+df_speed %>%
+  dplyr::select(position, alexa_speed_msec) %>%
+  ggplot(aes(position, alexa_speed_msec, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       breaks = seq(0, 7*10^6, by = 10^6),
+                       labels = c("0", "1M", "2M", "3M", "4M", "5M", "6M", "7M")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "ALEXA PAGE SPEED (MSEC)",
+           title = "THE MAJORITY OF URL'S REPORT A SPEED\nOF 1.7 SECONDS BUT SOME ARE REMARKABLY SLOWER.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_2_multiint_speed.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_2_multiint_speed.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+```{r plot-pagespeed-multiinterval-zoom, fig.width = 9, fig.height = 6.9}
+df_speed %>%
+  dplyr::select(position, alexa_speed_msec) %>%
+  ggplot(aes(position, alexa_speed_msec, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.01, .01),
+                       limits = c(0, NA),
+                       breaks = seq(0, 5000, by = 1000),
+                       labels = c("0", "1K", "2K", "3K", "4K", "5K")) +
+    scale_color_manual(values = int_cols[2:6],
+                       labels = int_perc[2:6],
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "ALEXA PAGE SPEED (MSEC)",
+           title = "THE MAJORITY OF URL'S REPORT A SPEED OF 1.7 SECONDS.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_2_multiint_speed_zoom.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_2_multiint_speed_zoom.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+#### Effect of Large Domains
+
+```{r plot-pagespeed-multiinterval-large-domains-zoom, fig.width = 9, fig.height = 6.9}
+df_speed %>%
+  dplyr::select(position, alexa_speed_msec, is_large) %>%
+  ggplot(aes(position, alexa_speed_msec, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95)) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02)) +#,
+                       #breaks = seq(0, 1.5*10^6, by = 2.5*10^5),
+                       #labels = c("0", "250K", "500K", "750K", "1M", "1.25M", "1.5M")) +
+    scale_color_manual(values = int_cols[2:6],
+                       labels = int_perc[2:6],
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "ALEXA PAGE SPEED (MSEC)",
+         title = "LARGE DOMAINS HAVE A SMALLER RANGE AND OVERALL SLOWER\nPAGE SPEED THAN OTHER DOMAINS (MEDIAN OF 2,450 VERSUS 1,653).") +
+    theme_flip +
+    theme(legend.position = "bottom",
+          legend.margin = margin(t = 10),
+          panel.spacing.x = unit(2, "lines"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_2_multiint_speed_facet_zoom.png"), width = 9, height = 7.1, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_2_multiint_speed_facet_zoom.pdf"), width = 9, height = 7.1, device = cairo_pdf)
+}
+```
+
+
+```{r plot-pagespeed-multiinterval-large-domains-detail, fig.width = 9, fig.height = 7.3}
+df_large_domains <-
+  df_speed %>%
+  dplyr::select(position, alexa_speed_msec, large_domains) %>%
+  filter(large_domains != "other") %>%
+  group_by(large_domains) %>%
+  mutate(m = mean(alexa_speed_msec, na.rm = T)) %>%
+  mutate(
+    is_lower = case_when(
+      alexa_speed_msec < m ~ 1,
+      alexa_speed_msec > m ~ 0,
+      alexa_speed_msec == m ~ -1
+    )
+  ) %>%
+  summarize(
+    avg = unique(m),
+    min = min(alexa_speed_msec, na.rm = T),
+    max = max(alexa_speed_msec, na.rm = T),
+    p_below = mean(position[is_lower == 1], na.rm = T),
+    p_above = mean(position[is_lower == 0], na.rm = T)
+  ) %>%
+  mutate(
+    c_low = if_else(p_below > p_above, "lower", "higher"),
+    c_high = if_else(p_below < p_above, "lower", "higher"),
+    c_low = if_else(is.na(c_low), "lower", c_low),  ## doesn't matter, just to remove from legend
+    c_high = if_else(is.na(c_high), "lower", c_high)
+  ) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, avg))
+
+df_large_domains %>%
+  ggplot(aes(avg, large_domains)) +
+    geom_segment(aes(x = avg,
+                     xend = min,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_low),
+                 size = 1.3) +
+    geom_segment(aes(x = avg,
+                     xend = max,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_high),
+                 size = 1.3) +
+    geom_point(size = 3) +
+    scale_y_discrete(expand = c(.03, .03)) +
+    scale_x_continuous(expand = c(.03, .03),
+                       breaks = seq(0, 12500, by = 2500),
+                       labels = glue::glue("{seq(0, 12.5, by = 2.5)}K")) +
+    scale_color_manual(values = c(bl_col, "#8800d1"),
+                       name = "Average Position Below/Above the Metric's Average is...") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "ALEXA PAGE SPEED (MSEC)", y = NULL,
+           title = "TARGET AND YELP HAVE THE SLOWEST URL'S ON AVERAGE,\nMAPQUEST AND YELLOWPAGES THE FASTEST.") +
+    theme_flip +
+    theme(plot.title.position = "plot",
+          legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.key.width = unit(14, "lines"),
+          legend.spacing.x = unit(0.75, "pt"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_2_segments_speed_largedoms.png"), width = 9, height = 7.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_2_segments_speed_largedoms.pdf"), width = 9, height = 7.3, device = cairo_pdf)
+}
+
+rm(df_large_domains)
+```
+
+
+```{r rm-data-2-2-2}
+rm(df_speed)
+```
+
+
+
+### 2.2.3 Time-on-Site (MySQL)
+
+```{r data-2-2-3}
+df_time <- readRDS(here::here("proc_data", "sql_timeonsite.Rds"))
+```
+
+
+```{r plot-time-histogram, fig.width = 9, fig.height = 6.3}
+ggplot(df_time, aes(alexa_daily_time_on_site_sec + 1)) +
+  geom_histogram(bins = 35, color = "#389977", fill = bl_col, size = .8) +
+  scale_x_log10(expand = c(.01, .01),
+                breaks = c(10^1, 10^2, 10^3, 10^4) + 1,
+                labels = c("10", "100", "1K", "10K")) +
+  scale_y_continuous(expand = c(.02, .02),
+                     breaks = seq(0, 1.5*10^6, length.out = 7),
+                     labels = c("0", "250K", "500K", "750K", "1M", "1.25M", "1.5M")) +
+  labs(x = "ALEXA DAILY TIME ON SITE (SEC)", y = "COUNT",
+       title = "TIME ON SITE, ANOTHER MEASURE PROVIDED BY ALEXA, IS\nDISTRIBUTED NORMALLY (LOG SCALE) WITH A MEAN OF 200 SEC.")
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_3_histogram_time.png"), width = 9, height = 6.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_3_histogram_time.pdf"), width = 9, height = 6.3, device = cairo_pdf)
+}
+```
+
+```{r plot-time-pointinterval, fig.width = 9, fig.height = 6.2}
+df_time %>%
+  dplyr::select(position, alexa_daily_time_on_site_sec) %>%
+  ggplot(aes(position, alexa_daily_time_on_site_sec, color = position)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x, # + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       breaks = seq(0, 1000, by = 100)) +
+    scale_color_gradient2(low = "#008556",
+                          mid = bl_col,
+                          high = "#79d8b6",
+                          midpoint = 5,
+                          guide = F) +
+    labs(x = "POSITION", y = "ALEXA DAILY TIME ON SITE (SEC)",
+           title = "TIME ON SITE IS POSITIVELY CORRELATED WITH POSITION:\nTHE TIME INCREASES BY 3 SECONDS PER POSITION.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_3_pointint_time_lm.png"), width = 9, height = 5.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_3_pointint_time_lm.pdf"), width = 9, height = 5.9, device = cairo_pdf)
+}
+```
+
+
+```{r plot-time-multiinterval, fig.width = 9, fig.height = 6.9}
+df_time %>%
+  dplyr::select(position, alexa_daily_time_on_site_sec) %>%
+  ggplot(aes(position, alexa_daily_time_on_site_sec + 1, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    # scale_y_continuous(expand = c(.02, .02),
+    #                    breaks = seq(0, 1.5*10^4, by = 2.5*10^3),
+    #                    labels = c("0", "2.5K", "5K", "7.5K", "10K", "1.25K", "1.5K")) +
+    scale_y_log10(expand = c(.01, .01),
+                  breaks = c(10^1, 10^2, 10^3, 10^4) + 1,
+                  labels = c("10", "100", "1K", "10K")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "ALEXA DAILY TIME ON SITE (SEC)",
+           title = "THE MEDIAN TIME ON SITE IS 2.5 MINUTES WITH\nA SLIGHT INCREASE IN TIME-ON-SITE WITH POSITION.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_3_multiint_time_log.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_3_multiint_time_log.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+#### Effect of Large Domains
+
+```{r plot-time-multiinterval-large-domains, fig.width = 9, fig.height = 6.9}
+df_time %>%
+  dplyr::select(position, alexa_daily_time_on_site_sec, is_large) %>%
+  ggplot(aes(position, alexa_daily_time_on_site_sec + 1, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    # scale_y_continuous(expand = c(.02, .02),
+    #                    breaks = seq(0, 1.5*10^4, by = 2.5*10^3),
+    #                    labels = c("0", "2.5K", "5K", "7.5K", "10K", "1.25K", "1.5K")) +
+    scale_y_log10(expand = c(.01, .01),
+                  breaks = c(10^1, 10^2, 10^3, 10^4) + 1,
+                  labels = c("10", "100", "1K", "10K")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "ALEXA DAILY TIME ON SITE (SEC)",
+         title = "LARGE DOMAINS HAVE REMARKABLY SMALLER RANGES OF TIME\nON SITE COMPARED TO OTHER DOMAINS. HOWEVER, THE MAJORITY\nOF VISITS ON LARGE DOMAINS WERE CONSIDERABLY LONGER.") +
+    theme_flip +
+    theme(legend.position = "bottom",
+          legend.margin = margin(t = 10),
+          panel.spacing.x = unit(2, "lines"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_3_multiint_time_facet_log.png"), width = 9, height = 7.1, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_3_multiint_time_facet_log.pdf"), width = 9, height = 7.1, device = cairo_pdf)
+}
+```
+
+#### -- zoom-in
+
+```{r plot-time-multiinterval-large-domains-zoom, fig.width = 9, fig.height = 6.9}
+df_time %>%
+  dplyr::select(position, alexa_daily_time_on_site_sec, is_large) %>%
+  ggplot(aes(position, alexa_daily_time_on_site_sec, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95)) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       breaks = seq(0, 1000, by = 200)) +
+    scale_color_manual(values = int_cols[2:6],
+                       labels = int_perc[2:6],
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "ALEXA DAILY TIME ON SITE (SEC)",
+         title = "LARGE DOMAINS HAVE REMARKABLY SMALLER RANGES OF TIME\nON SITE COMPARED TO OTHER DOMAINS. HOWEVER, THE MAJORITY\nOF VISITS ON LARGE DOMAINS WERE CONSIDERABLY LONGER.") +
+    theme_flip +
+    theme(legend.position = "bottom",
+          legend.margin = margin(t = 10),
+          panel.spacing.x = unit(2, "lines"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_3_multiint_time_facet_zoom.png"), width = 9, height = 7.1, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_3_multiint_time_facet_zoom.pdf"), width = 9, height = 7.1, device = cairo_pdf)
+}
+```
+
+```{r plot-time-multiinterval-large-domains-detail, fig.width = 9, fig.height = 7.3}
+df_large_domains <-
+  df_time %>%
+  dplyr::select(position, alexa_daily_time_on_site_sec, large_domains) %>%
+  filter(large_domains != "other") %>%
+  group_by(large_domains) %>%
+  mutate(m = mean(alexa_daily_time_on_site_sec, na.rm = T)) %>%
+  mutate(
+    is_lower = case_when(
+      alexa_daily_time_on_site_sec < m ~ 1,
+      alexa_daily_time_on_site_sec > m ~ 0,
+      alexa_daily_time_on_site_sec == m ~ -1
+    )
+  ) %>%
+  summarize(
+    avg = unique(m),
+    min = min(alexa_daily_time_on_site_sec, na.rm = T),
+    max = max(alexa_daily_time_on_site_sec, na.rm = T),
+    p_below = mean(position[is_lower == 1], na.rm = T),
+    p_above = mean(position[is_lower == 0], na.rm = T)
+  ) %>%
+  mutate(
+    c_low = if_else(p_below > p_above, "lower", "higher"),
+    c_high = if_else(p_below < p_above, "lower", "higher"),
+    c_low = if_else(is.na(c_low), "lower", c_low),  ## doesn't matter, just to remove from legend
+    c_high = if_else(is.na(c_high), "lower", c_high)
+  ) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, avg))
+
+df_large_domains %>%
+  ggplot(aes(avg, large_domains)) +
+    geom_segment(aes(x = avg,
+                     xend = min,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_low),
+                 size = 1.3) +
+    geom_segment(aes(x = avg,
+                     xend = max,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_high),
+                 size = 1.3) +
+    geom_point(size = 3) +
+    scale_y_discrete(expand = c(.03, .03)) +
+    scale_x_continuous(expand = c(.02, .02),
+                       breaks = seq(0, 1000, by = 200)) +
+    scale_color_manual(values = c(bl_col, "#8800d1"),
+                       name = "Average Position Below/Above the Metric's Average is...") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "ALEXA DAILY TIME ON SITE (SEC)", y = NULL,
+           title = "ON AVERAGE, VISITORS SPEND THE LONGEST TIME ON\nFACEBOOK, FOLLOWED BY YOUTUBE, TWITTER AND LINKEDIN.") +
+    theme_flip +
+    theme(plot.title.position = "plot",
+          legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.key.width = unit(14, "lines"),
+          legend.spacing.x = unit(0.75, "pt"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_2_3_segments_time_largedoms.png"), width = 9, height = 7.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_2_3_segments_time_largedoms.pdf"), width = 9, height = 7.3, device = cairo_pdf)
+}
+
+rm(df_large_domains)
+```
+
+
+```{r rm-data-2-2-3}
+rm(df_speed)
+```
+
+
+
+## 2.3 Page-level Factors
+
+
+### 2.3.1 HTML Tags (Title, Meta Description, H1, H2, H3) (MySQL)
+
+Title tag and h1 has perference, others bonus.
+
+
+#### Title
+
+```{r data-2-3-1-title}
+df_title <- readRDS(here::here("proc_data", "sql_title.Rds"))
+```
+
+
+```{r plot-title-histogram, fig.width = 9, fig.height = 6.3}
+ggplot(df_title, aes(title_match)) +
+  geom_histogram(bins = 35, color = "#389977", fill = bl_col, size = .8) +
+  scale_x_continuous(expand = c(.015, .015),
+                     breaks = seq(0, 1, by = .1),
+                     labels = glue::glue("{seq(0, 100, by = 10)}%")) +
+  scale_y_continuous(expand = c(.02, .02),
+                     breaks = seq(0, 10^6, length.out = 5),
+                     labels = c("0", "250K", "500K", "750K", "1M")) +
+  labs(x = "KEYWORD PERCENTAGE IN TITLE", y = "COUNT",
+       title = "MOST URL TITLES CONTAIN 65% TO 85% OF THE KEYWORD.")
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_1_histogram_title.png"), width = 9, height = 6.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_1_histogram_title.pdf"), width = 9, height = 6.3, device = cairo_pdf)
+}
+```
+
+
+```{r plot-title-pointinterval, fig.width = 9, fig.height = 6.2}
+df_title %>%
+  dplyr::select(position, title_match) %>%
+  ggplot(aes(position, title_match, color = position)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x,# + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.015, .015),
+                       breaks = seq(0, 1, by = .1),
+                       labels = glue::glue("{seq(0, 100, by = 10)}%")) +
+    scale_color_gradient2(low = "#008556",
+                          mid = bl_col,
+                          high = "#79d8b6",
+                          midpoint = 5,
+                          guide = F) +
+    labs(x = "POSITION", y = "KEYWORD PERCENTAGE IN TITLE",
+           title = "THE MATCHING OF KEYWORD AND TITLE ARE\nALMOST THE SAME AMONG POSITIONS.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_1_pointint_title_lm.png"), width = 9, height = 5.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_1_pointint_title_lm.pdf"), width = 9, height = 5.9, device = cairo_pdf)
+}
+```
+
+
+```{r plot-title-multiinterval, fig.width = 9, fig.height = 6.9}
+df_title %>%
+  dplyr::select(position, title_match) %>%
+  ggplot(aes(position, title_match, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.01, .01),
+                       breaks = seq(0, 1, by = .1),
+                       labels = glue::glue("{seq(0, 100, by = 10)}%")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "KEYWORD PERCENTAGE IN TITLE",
+           title = "THE MATCHING OF KEYWORD AND TITLE ARE\nALMOST THE SAME AMONG POSITIONS.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_1_multiint_title.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_1_multiint_title.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+#### Effect of Large Domains
+
+```{r plot-title-multiinterval-large-domains, fig.width = 9, fig.height = 6.9}
+df_title %>%
+  dplyr::select(position, title_match, is_large) %>%
+  ggplot(aes(position, title_match, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.01, .01),
+                       breaks = seq(0, 1, by = .2),
+                       labels = glue::glue("{seq(0, 100, by = 20)}%")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "KEYWORD PERCENTAGE IN TITLE",
+         title = "WHILE KEYWORD MATCHING OF TITLES IN LARGE DOMAINS\nDECREASES BY ~2% FROMH POSITION 10 TO 1, OTHER\nDOMAINS SHOW AN INCREASE IN MATCHING BY ~1%.") +
+    theme_flip +
+    theme(legend.position = "bottom",
+          legend.margin = margin(t = 10),
+          panel.spacing.x = unit(2, "lines"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_1_multiint_title_facet.png"), width = 9, height = 7.1, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_1_multiint_title_facet.pdf"), width = 9, height = 7.1, device = cairo_pdf)
+}
+
+
+## linear model
+lm_title <- summary(lm(title_match ~ position, data = df_title))
+
+df_ld <- filter(df_title, is_large == "Large Domains")
+lm_title_ld <- summary(lm(title_match ~ position, data = df_ld))
+
+df_od <- filter(df_title, is_large == "Other Domains")
+lm_title_od <- summary(lm(title_match ~ position, data = df_od))
+```
+
+
+```{r plot-title-multiinterval-large-domains-detail, fig.width = 9, fig.height = 7.3}
+df_large_domains <-
+  df_title %>%
+  dplyr::select(position, title_match, large_domains) %>%
+  filter(large_domains != "other") %>%
+  group_by(large_domains) %>%
+  mutate(m = mean(title_match, na.rm = T)) %>%
+  mutate(
+    is_lower = case_when(
+      title_match < m ~ 1,
+      title_match > m ~ 0,
+      title_match == m ~ -1
+    )
+  ) %>%
+  summarize(
+    avg = unique(m),
+    min = min(title_match, na.rm = T),
+    max = max(title_match, na.rm = T),
+    p_below = mean(position[is_lower == 1], na.rm = T),
+    p_above = mean(position[is_lower == 0], na.rm = T)
+  ) %>%
+  mutate(
+    c_low = if_else(p_below > p_above, "lower", "higher"),
+    c_high = if_else(p_below < p_above, "lower", "higher"),
+    c_low = if_else(is.na(c_low), "lower", c_low),  ## doesn't matter, just to remove from legend
+    c_high = if_else(is.na(c_high), "lower", c_high)
+  ) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, avg))
+
+df_large_domains %>%
+  ggplot(aes(avg, large_domains)) +
+    geom_segment(aes(x = avg,
+                     xend = min,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_low),
+                 size = 1.3) +
+    geom_segment(aes(x = avg,
+                     xend = max,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_high),
+                 size = 1.3) +
+    geom_point(size = 3) +
+    scale_y_discrete(expand = c(.03, .03)) +
+    scale_x_continuous(expand = c(.01, .01),
+                       breaks = seq(0, 1, by = .1),
+                       labels = glue::glue("{seq(0, 100, by = 10)}%")) +
+    scale_color_manual(values = c(bl_col, "#8800d1"),
+                       name = "Average Position Below/Above the Metric's Average is...") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "KEYWORD PERCENTAGE IN TITLE", y = NULL,
+           title = "TITLES OF QUORA URL'S MATCH PARTICULARLY WELL WITH KEYWORDS,\nTHOSE OF YOUTUBE AND YELP THE WORST (BELOW 50% ON AVERAGE).") +
+    theme_flip +
+    theme(plot.title.position = "plot",
+          legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.key.width = unit(14, "lines"),
+          legend.spacing.x = unit(0.75, "pt"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_1_segments_title_largedoms.png"), width = 9, height = 7.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_1_segments_title_largedoms.pdf"), width = 9, height = 7.3, device = cairo_pdf)
+}
+
+rm(df_large_domains)
+```
+
+
+```{r rm-data-2-3-1-title}
+rm(df_title)
+```
+
+
+
+#### H1 Tag
+
+```{r data-2-3-1-h1tag}
+df_h1 <- readRDS(here::here("proc_data", "sql_h1tag.Rds"))
+```
+
+
+```{r plot-h1tag-histogram, fig.width = 9, fig.height = 6.3}
+ggplot(df_h1, aes(h1_match)) +
+  geom_histogram(bins = 35, color = "#389977", fill = bl_col, size = .8) +
+  scale_x_continuous(expand = c(.015, .015),
+                     breaks = seq(0, 1, by = .1),
+                     labels = glue::glue("{seq(0, 100, by = 10)}%")) +
+  scale_y_continuous(expand = c(.02, .02),
+                     breaks = seq(0, 6*10^5, by = 2*10^5),
+                     labels = c("0", "200K", "400K", "600K")) +
+  labs(x = "KEYWORD PERCENTAGE IN H1 TAG", y = "COUNT",
+       title = "H1 TAGS OF MOST URL'S CONTAIN 60% TO 80% OF THE KEYWORD.")
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_1_histogram_h1.png"), width = 9, height = 6.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_1_histogram_h1.pdf"), width = 9, height = 6.3, device = cairo_pdf)
+}
+```
+
+
+```{r plot-h1tag-pointinterval, fig.width = 9, fig.height = 6.2}
+df_h1 %>%
+  dplyr::select(position, h1_match) %>%
+  ggplot(aes(position, h1_match, color = position)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x,# + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.015, .015),
+                       breaks = seq(0, 1, by = .1),
+                       labels = glue::glue("{seq(0, 100, by = 10)}%")) +
+    scale_color_gradient2(low = "#008556",
+                          mid = bl_col,
+                          high = "#79d8b6",
+                          midpoint = 5,
+                          guide = F) +
+    labs(x = "POSITION", y = "KEYWORD PERCENTAGE IN H1 TAG",
+           title = "THE MATCHING OF KEYWORD AND H1 TAG ARE\nALMOST THE SAME AMONG POSITIONS.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_1_pointint_h1_lm.png"), width = 9, height = 5.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_1_pointint_h1_lm.pdf"), width = 9, height = 5.9, device = cairo_pdf)
+}
+```
+
+
+```{r plot-h1tag-multiinterval, fig.width = 9, fig.height = 6.9}
+df_h1 %>%
+  dplyr::select(position, h1_match) %>%
+  ggplot(aes(position, h1_match, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.01, .01),
+                       breaks = seq(0, 1, by = .1),
+                       labels = glue::glue("{seq(0, 100, by = 10)}%")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "KEYWORD PERCENTAGE IN H1 TAG",
+           title = "THE MATCHING OF KEYWORD AND H1 TAG ARE\nALMOST THE SAME AMONG POSITIONS.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_1_multiint_h1.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_1_multiint_h1.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+#### Effect of Large Domains
+
+```{r plot-h1tag-multiinterval-large-domains, fig.width = 9, fig.height = 6.9}
+df_h1 %>%
+  dplyr::select(position, h1_match, is_large) %>%
+  ggplot(aes(position, h1_match, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.01, .01),
+                       breaks = seq(0, 1, by = .2),
+                       labels = glue::glue("{seq(0, 100, by = 20)}%")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "KEYWORD PERCENTAGE IN H1 TAG",
+         title = "WHILE THERE IS NO TREND OF H1 MATCHING IN OTHER DOMAINS,\nTHE MATCHING CORRELATES WITH POSITION FOR LARGE DOMAINS.") +
+    theme_flip +
+    theme(legend.position = "bottom",
+          legend.margin = margin(t = 10),
+          panel.spacing.x = unit(2, "lines"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_1_multiint_h1_facet.png"), width = 9, height = 7.1, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_1_multiint_h1_facet.pdf"), width = 9, height = 7.1, device = cairo_pdf)
+}
+
+## linear model
+lm_h1 <- summary(lm(h1_match ~ position, data = df_h1))
+
+df_ld <- filter(df_h1, is_large == "Large Domains")
+lm_h1_ld <- summary(lm(h1_match ~ position, data = df_ld))
+
+df_od <- filter(df_h1, is_large == "Other Domains")
+lm_h1_od <- summary(lm(h1_match ~ position, data = df_od))
+```
+
+
+```{r plot-h1tag-multiinterval-large-domains-detail, fig.width = 9, fig.height = 7.3}
+df_large_domains <-
+  df_h1 %>%
+  dplyr::select(position, h1_match, large_domains) %>%
+  filter(large_domains != "other") %>%
+  group_by(large_domains) %>%
+  mutate(m = mean(h1_match, na.rm = T)) %>%
+  mutate(
+    is_lower = case_when(
+      h1_match < m ~ 1,
+      h1_match > m ~ 0,
+      h1_match == m ~ -1
+    )
+  ) %>%
+  summarize(
+    avg = unique(m),
+    min = min(h1_match, na.rm = T),
+    max = max(h1_match, na.rm = T),
+    p_below = mean(position[is_lower == 1], na.rm = T),
+    p_above = mean(position[is_lower == 0], na.rm = T)
+  ) %>%
+  mutate(
+    c_low = if_else(p_below > p_above, "lower", "higher"),
+    c_high = if_else(p_below < p_above, "lower", "higher"),
+    c_low = if_else(is.na(c_low), "lower", c_low),  ## doesn't matter, just to remove from legend
+    c_high = if_else(is.na(c_high), "lower", c_high)
+  ) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, avg))
+
+df_large_domains %>%
+  ggplot(aes(avg, large_domains)) +
+    geom_segment(aes(x = avg,
+                     xend = min,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_low),
+                 size = 1.3) +
+    geom_segment(aes(x = avg,
+                     xend = max,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_high),
+                 size = 1.3) +
+    geom_point(size = 3) +
+    scale_y_discrete(expand = c(.03, .03)) +
+    scale_x_continuous(expand = c(.03, .03),
+                       breaks = seq(0, 1, by = .1),
+                       labels = glue::glue("{seq(0, 100, by = 10)}%")) +
+    scale_color_manual(values = c(bl_col, "#8800d1"),
+                       name = "Average Position Below/Above the Metric's Average is...") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "KEYWORD PERCENTAGE IN H1 TAG", y = NULL,
+           title = "AMONG URL'S FROM LARGE DOMAINS, H1 TAGS SHOW A HIGH\nVARIABILITY IN MATCHING WITH THE KEYWORD. URL'S OF QUORA\n SCORE THE BEST, FACEBOOK, YELLOWPAGES AND IMDB THE WORST.") +
+    theme_flip +
+    theme(plot.title.position = "plot",
+          legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.key.width = unit(14, "lines"),
+          legend.spacing.x = unit(0.75, "pt"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_1_segments_h1_largedoms.png"), width = 9, height = 7.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_1_segments_h1_largedoms.pdf"), width = 9, height = 7.3, device = cairo_pdf)
+}
+
+rm(df_large_domains)
+```
+
+
+```{r rm-data-2-3-1-h1tag}
+rm(df_h1)
+```
+
+
+
+### 2.3.2 Page Size (MySQL)
+
+```{r data-2-3-2}
+df_size <- readRDS(here::here("proc_data", "sql_pagesize.Rds"))
+```
+
+
+```{r plot-pagesize-histogram, fig.width = 9, fig.height = 6.3}
+ggplot(df_size, aes(page_size + 1)) +
+  geom_histogram(bins = 35, color = "#389977", fill = bl_col, size = .8) +
+  scale_x_log10(expand = c(.01, .01),
+                breaks = c(1, 10, 100, 1000, 10000),
+                labels = c("0", "10", "100", "1K", "10K")) +
+  scale_y_continuous(expand = c(.02, .02),
+                     breaks = seq(0, 10^6, length.out = 5),
+                     labels = c("0", "250K", "500K", "750K", "1M")) +
+  labs(x = "PAGE SIZE", y = "COUNT",
+       title = "PAGE SIZE OF MOST URL'S FALL BETWEEN 10 AND 1,000.")
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_2_histogram_pagesize.png"), width = 9, height = 6.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_2_histogram_pagesize.pdf"), width = 9, height = 6.3, device = cairo_pdf)
+}
+```
+
+
+```{r plot-pagesize-pointinterval, fig.width = 9, fig.height = 6.2}
+df_size %>%
+  dplyr::select(position, page_size) %>%
+  #median_qi(page_size) %>%
+  ggplot(aes(position, page_size, color = position)) +
+    #geom_pointintervalh(aes(xmin = .lower, xmax = .upper)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x,# + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       breaks = seq(0, 1000, by = 100)) +
+    scale_color_gradient2(low = "#008556",
+                          mid = bl_col,
+                          high = "#79d8b6",
+                          midpoint = 5,
+                          guide = F) +
+    labs(x = "POSITION", y = "PAGE SIZE",
+           title = "THERE IS NO CORRELATION OF PAGE SIZE WITH POSTION.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_2_pointint_pagesize_lm.png"), width = 9, height = 5.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_2_pointint_pagesize_lm.pdf"), width = 9, height = 5.9, device = cairo_pdf)
+}
+```
+
+
+```{r plot-pagesize-multiinterval, fig.width = 9, fig.height = 6.9}
+df_size %>%
+  dplyr::select(position, page_size) %>%
+  ggplot(aes(position, page_size, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       breaks = seq(0, 70000, by = 10000),
+                       labels = c(0, glue::glue("{seq(10, 70, by = 10)}K"))) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "PAGE SIZE",
+           title = "PAGE SIZE DOES NOT DIFFER MUCH AMONG\n POSITIONS AND MOST URL'S ARE VERY SMALL.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_2_multiint_pagesize.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_2_multiint_pagesize.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+#### -- zoom-in
+
+```{r plot-pagesize-multiinterval-zoom, fig.width = 9, fig.height = 6.9}
+df_size %>%
+  dplyr::select(position, page_size) %>%
+  ggplot(aes(position, page_size, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       breaks = seq(0, 1000, by = 100)) +
+    scale_color_manual(values = int_cols[3:6],
+                       labels = int_perc[3:6],
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "PAGE SIZE",
+           title = "PAGE SIZE DOES NOT DIFFER MUCH AMONG\n POSITIONS AND MOST URL'S ARE VERY SMALL.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_2_multiint_pagesize_zoom.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_2_multiint_pagesize_zoom.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+#### Effect of Large Domains
+
+```{r plot-pagesize-multiinterval-large-domains, fig.width = 9, fig.height = 6.9}
+df_size %>%
+  dplyr::select(position, page_size, is_large) %>%
+  ggplot(aes(position, page_size, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.01, .01),
+                       breaks = seq(0, 70000, by = 10000),
+                       labels = c(0, glue::glue("{seq(10, 70, by = 10)}K"))) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "PAGE SIZE",
+         title = "LARGE DOMAINS HAVE REMARKABLY LOWER PAGE SIZES\nCOMPARED TO ALL OTHER DOMAINS OVERALL BUT A\nWIDER RANGE FOR 75% OF THE URL'S.") +
+    theme_flip +
+    theme(legend.position = "bottom",
+          legend.margin = margin(t = 10),
+          panel.spacing.x = unit(2, "lines"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_2_multiint_pagesize_facet.png"), width = 9, height = 7.1, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_2_multiint_pagesize_facet.pdf"), width = 9, height = 7.1, device = cairo_pdf)
+}
+```
+
+
+#### -- zoom-in
+
+```{r plot-pagesize-multiinterval-large-domains-zoom, fig.width = 9, fig.height = 6.9}
+df_size %>%
+  dplyr::select(position, page_size, is_large) %>%
+  ggplot(aes(position, page_size, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75)) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       breaks = seq(0, 1500, by = 250)) +
+    scale_color_manual(values = int_cols[3:6],
+                       labels = int_perc[3:6],
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "PAGE SIZE",
+           title = "FOR THE MAIN 75% OF LARGE DOMAIN URL'S, PAGES ARE\nREMARKABLY LARGER THAN THOSE OF OTHER DOMAINS.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_2_multiint_pagesize_facet_zoom.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_2_multiint_pagesize_facet_zoom.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+```{r plot-pagesize-multiinterval-large-domains-detail, fig.width = 9, fig.height = 7.6}
+df_large_domains <-
+  df_size %>%
+  dplyr::select(position, page_size, large_domains) %>%
+  filter(large_domains != "other") %>%
+  group_by(large_domains) %>%
+  mutate(m = mean(page_size, na.rm = T)) %>%
+  mutate(
+    is_lower = case_when(
+      page_size < m ~ 1,
+      page_size > m ~ 0,
+      page_size == m ~ -1
+    )
+  ) %>%
+  summarize(
+    avg = unique(m),
+    min = min(page_size, na.rm = T),
+    max = max(page_size, na.rm = T),
+    p_below = mean(position[is_lower == 1], na.rm = T),
+    p_above = mean(position[is_lower == 0], na.rm = T)
+  ) %>%
+  mutate(
+    c_low = if_else(p_below > p_above, "lower", "higher"),
+    c_high = if_else(p_below < p_above, "lower", "higher"),
+    c_low = if_else(is.na(c_low), "lower", c_low),  ## doesn't matter, just to remove from legend
+    c_high = if_else(is.na(c_high), "lower", c_high)
+  ) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, avg))
+
+df_large_domains %>%
+  ggplot(aes(avg, large_domains)) +
+    geom_segment(aes(x = avg,
+                     xend = min,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_low),
+                 size = 1.3) +
+    geom_segment(aes(x = avg,
+                     xend = max,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_high),
+                 size = 1.3) +
+    geom_point(size = 3) +
+    scale_y_discrete(expand = c(.03, .03)) +
+    scale_x_continuous(expand = c(.03, .03),
+                       breaks = seq(0, 3500, by = 500)) +
+    scale_color_manual(values = c(bl_col, "#8800d1"),
+                       name = "Average Position Below/Above the Metric's Average is...") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "PAGE SIZE", y = NULL,
+           title = "TRIPADVISOR AND YOUTUBE HAVE THE LARGEST, \nYELLOWPAGES AND WIKIPEDIA THE SMALLEST PAGES ON AVERAGE.") +
+    theme_flip +
+    theme(plot.title.position = "plot",
+          legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.key.width = unit(14, "lines"),
+          legend.spacing.x = unit(0.75, "pt"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_2_segments_pagesize_largedoms.png"), width = 9, height = 7.6, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_2_segments_pagesize_largedoms.pdf"), width = 9, height = 7.6, device = cairo_pdf)
+}
+
+rm(df_large_domains)
+```
+
+
+```{r rm-data-2-3-2}
+rm(df_size)
+```
+
+
+
+### 2.3.3 Content Score (ClearScope)
+
+The "content score" maps to the letter grade in Clearscope as follows:
+F: 1-15
+C-: 16-30
+C+: 31-45
+B-: 46-60
+B+: 61-75
+A-: 76-90
+A+: 91-99
+A++: 100
+
+!!TODO CED: Already numeric, all fine. Maybe I plot it with grades, let's see (is this smt of interest?)
+
+```{r plot-contentscope-multiint, fig.width = 9, fig.height = 6.9}
+df_scope_long <-
+  df_scope %>%
+  pivot_longer(
+    cols = desktop_pos:mobile_pos,
+    names_to = "type",
+    values_to = "position"
+  ) %>%
+  filter(!is.na(position)) %>%
+  mutate(
+    type = if_else(type == "desktop_pos", "On Desktop", "On Mobile"),
+    content_score = if_else(content_score > 100, 100, content_score), ## fix more than 100%
+    position = round(position, 0) ## remove ties x.5
+  )
+
+df_scope_long %>%
+  ggplot(aes(position, content_score, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    facet_wrap(~ type, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:30,
+                    limits = c(30.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       breaks = seq(0, 100, by = 20)) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "CONTENT SCORE",
+           title = "HIGHER CONTENT SCORES CORRELATE WITH BETTER POSITIONS:\nAN INCREASE OF 1 IS SIMILAR TO AN INCREASE OF 1 POSITION.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_3_multiint_contentscope.png"), width = 9, height = 10.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_3_multiint_contentscope.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+```{r plot-contentscope-multiint-zoom, fig.width = 9, fig.height = 6.9}
+df_scope_long %>%
+  ggplot(aes(position, content_score, group = position)) +
+    stat_interval(.width = c(.05, .25, .5)) +
+    facet_wrap(~ type, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:30,
+                    limits = c(30.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       breaks = seq(0, 100, by = 20)) +
+    scale_color_manual(values = int_cols[c(3, 4, 6)],
+                       labels = int_perc[4:6],
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+<<<<<<< HEAD
+    labs(x = "POSITION", y = "CONTENT SCORE",
+           title = "HIGHER CONTENT SCORES CORRELATE WITH BETTER POSITIONS:\nAN INCREASE OF 1% IS SIMILAR TO AN INCREASE OF 1 POSITION.") +
+=======
+    labs(x = "POSITION (?)", y = "CONTENT SCORE",
+           title = "HIGHER CONTENT SCORES CORRELATE WITH BETTER POSITIONS:\nAN INCREASE OF 1 IS SIMILAR TO AN INCREASE OF 1 POSITION.") +
+>>>>>>> 0ef7f551aecc6377fb3f881fc7fa93110a680d88
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_3_multiint_contentscope_zoom.png"), width = 9, height = 10.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_3_multiint_contentscope_zoom.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+
+rm(df_scope, df_scope_long)
+```
+
+
+
+### 2.3.4 Broken Links (mySQL)
+
+```{r data-2-3-4}
+df_broken <- readRDS(here::here("proc_data", "sql_brokenlinks.Rds"))
+```
+
+
+
+```{r plot-brokenlinks-histogram, fig.width = 9, fig.height = 6.3}
+ggplot(df_broken, aes(broken_links_amount_body + 1)) +
+  geom_histogram(bins = 35, color = "#389977", fill = bl_col, size = .8) +
+  scale_x_log10(expand = c(.02, .02))+#,
+                #breaks = c(0, 10^2, 10^4, 10^6) + 1,
+                #labels = c("1", "100", "10K", "1M")) +
+  scale_y_continuous(expand = c(.02, .02))+#,
+                    # breaks = seq(0, 2*10^6, length.out = 5),
+                     #labels = c("0", "0.5M", "1M", "1.5M", "2M")) +
+  labs(x = "POSITION", y = "AMOUNT OF BROKEN LINKS IN BODY",
+           title = "MOST URL'S CONTAIN BETWEEN X AND XXX BROKEN LINKS.")
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_4_histogram_broken.png"), width = 9, height = 6.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_4_histogram_broken.pdf"), width = 9, height = 6.3, device = cairo_pdf)
+}
+```
+
+```{r plot-brokenlinks-pointinterval, fig.width = 9, fig.height = 6.2}
+df_broken %>%
+  dplyr::select(position, broken_links_amount_body) %>%
+  ggplot(aes(position, broken_links_amount_body, color = position)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x,# + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03))+#,
+                      # breaks = seq(0, 6000, by = 1000)) +
+    scale_color_gradient2(low = "#008556",
+                          mid = bl_col,
+                          high = "#79d8b6",
+                          midpoint = 5,
+                          guide = F) +
+    labs(x = "POSITION", y = "AMOUNT OF BROKEN LINKS IN BODY",
+           title = "THE AMOUNT OF WORDS DOES NOT\nDIFFER AMONG POSITIONS AT ALL.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_4_pointint_broken_lm.png"), width = 9, height = 5.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_4_pointint_broken_lm.pdf"), width = 9, height = 5.9, device = cairo_pdf)
+}
+```
+
+
+```{r plot-brokenlinks-multiinterval, fig.width = 9, fig.height = 6.9}
+df_broken %>%
+  dplyr::select(position, broken_links_amount_body) %>%
+  ggplot(aes(position, broken_links_amount_body, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02))+#,
+                       #breaks = seq(0, 1.5*10^6, by = 2.5*10^5),
+                       #labels = c("0", "250K", "500K", "750K", "1M", "1.25M", "1.5M")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "AMOUNT OF BROKEN LINKS IN BODY",
+           title = "MOST URL'S CONTAIN A BETWEEN 100 AND 10,000 WORDS.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_4_multiint_broken.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_4_multiint_broken.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+```{r plot-brokenlinks-multiinterval-log, fig.width = 9, fig.height = 6.9}
+df_broken %>%
+  dplyr::select(position, broken_links_amount_body) %>%
+  ggplot(aes(position, broken_links_amount_body + 1, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_log10(expand = c(.02, .02))+#,
+                  #breaks = c(0, 10^2, 10^4, 10^6) + 1,
+                  #labels = c("1", "100", "10K", "1M")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "AMOUNT OF BROKEN LINKS IN BODY",
+           title = "MOST URL'S CONTAIN A BETWEEN 100 AND 10.000 WORDS.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_4_multiint_broken_log.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_4_multiint_broken_log.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+
+#### Effect of Large Domains
+
+```{r plot-brokenlinks-multiinterval-large-domains, fig.width = 9, fig.height = 6.9}
+df_broken %>%
+  dplyr::select(position, broken_links_amount_body, is_large) %>df_broken%
+  ggplot(aes(position, broken_links_amount_body + 1, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    # scale_y_continuous(expand = c(.02, .02),
+    #                    breaks = seq(0, 1.5*10^6, by = 2.5*10^5),
+    #                    labels = c("0", "250K", "500K", "750K", "1M", "1.25M", "1.5M")) +
+    scale_y_log10(expand = c(.02, .02),
+                  breaks = c(0, 10^2, 10^4, 10^6) + 1,
+                  labels = c("1", "100", "10K", "1M")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "AMOUNT OF BROKEN LINKS IN BODY",
+         title = "LARGE DOMAINS HAVE MAXIMA OF AROUND 10,000 WORDS\nAND REMARKABLY LOWER MEDIAN OF WORDS (224)\nCOMPARED TO OTHER DOMAINS (932).") +
+    theme_flip +
+    theme(legend.position = "bottom",
+          legend.margin = margin(t = 10),
+          panel.spacing.x = unit(2, "lines"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_4_multiint_broken_facet_log.png"), width = 9, height = 7.1, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_4_multiint_broken_facet_log.pdf"), width = 9, height = 7.1, device = cairo_pdf)
+}
+```
+
+
+```{r plot-brokenlinks-multiinterval-large-domains-detail, fig.width = 9, fig.height = 7.3}
+df_large_domains <-
+  df_broken %>%
+  dplyr::select(position, broken_links_amount_body, large_domains) %>%
+  filter(large_domains != "other") %>%
+  group_by(large_domains) %>%
+  mutate(m = mean(broken_links_amount_body, na.rm = T)) %>%
+  mutate(
+    is_lower = case_when(
+      broken_links_amount_body < m ~ 1,
+      broken_links_amount_body > m ~ 0,
+      broken_links_amount_body == m ~ -1
+    )
+  ) %>%
+  summarize(
+    avg = unique(m),
+    min = min(broken_links_amount_body, na.rm = T),
+    max = max(broken_links_amount_body, na.rm = T),
+    p_below = mean(position[is_lower == 1], na.rm = T),
+    p_above = mean(position[is_lower == 0], na.rm = T)
+  ) %>%
+  mutate(
+    c_low = if_else(p_below > p_above, "lower", "higher"),
+    c_high = if_else(p_below < p_above, "lower", "higher"),
+    c_low = if_else(is.na(c_low), "lower", c_low),  ## doesn't matter, just to remove from legend
+    c_high = if_else(is.na(c_high), "lower", c_high)
+  ) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, avg))
+
+df_large_domains %>%
+  ggplot(aes(avg, large_domains)) +
+    geom_segment(aes(x = avg,
+                     xend = min,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_low),
+                 size = 1.3) +
+    geom_segment(aes(x = avg,
+                     xend = max,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_high),
+                 size = 1.3) +
+    geom_point(size = 3) +
+    scale_y_discrete(expand = c(.03, .03)) +
+    scale_x_continuous(expand = c(.03, .03),
+                       breaks = seq(0, 60000, by = 10000),
+                       labels = glue::glue("{seq(0, 60, by = 10)}K")) +
+    scale_color_manual(values = c(bl_col, "#8800d1"),
+                       name = "Average Position Below/Above the Metric's Average is...") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "AMOUNT OF BROKEN LINKS IN BODY", y = NULL,
+           title = "WORD COUNTS DIFFER SLIGHTLY AMONG LARGE DOMAINS.\nON AVERAGE, TRIPADVISOR CONTAINS THE MOST WORDS\nAND PINTEREST THE FEWEST. EBAY CONTAINS THE MOST OVERALL.") +
+    theme_flip +
+    theme(plot.title.position = "plot",
+          legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.key.width = unit(14, "lines"),
+          legend.spacing.x = unit(0.75, "pt"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_4_segments_broken_largedoms.png"), width = 9, height = 7.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_4_segments_broken_largedoms.pdf"), width = 9, height = 7.3, device = cairo_pdf)
+}
+
+rm(df_large_domains)
+```
+
+
+
+####### OLD HTTP RESPONSE CODE #######
+
+```{r plot-brokenlinks-bars, fig.width = 9, fig.height = 6.5}
+df_broken %>%
+  group_by(position) %>%
+  mutate(sum = n()) %>%
+  group_by(position, success) %>%
+  summarize(perc = n() / unique(sum)) %>%
+  mutate(perc = if_else(success == 0, -perc, perc)) %>%
+  ggplot(aes(position, perc, color = success > 0)) +
+    geom_segment(aes(xend = position, yend = 0),
+                 size = 7) +
+    #geom_point(size = 5) +
+    geom_hline(yintercept = 0,
+               color = "grey70",
+               size = 1.2) +
+    # geom_smooth(
+    #   method = "lm",
+    #   se = FALSE,
+    #   formula = y ~ x + I(x^2) + I(x^3),
+    #   color = "black"
+    # ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       limits = c(-1, 1),
+                       breaks = c(-1, -.5, 0, .5, 1),
+                       labels = c("100% No", "50% No", "Baseline", "50% Yes", "100% Yes")) +
+    scale_color_manual(values = c("#8800d1", bl_col), guide = F) +
+    labs(x = "POSITION", y = "HTTP RESPONSE STATUS SUCCESSFULL?",
+        title = "MOST URL'S RESPONDED SUCCESSFULLY TO THE SERVER REQUEST\nBY REPORTING THE HTTPS STATUS CODES 200, 201, 202, 203 OR 204.\n") +
+    theme_flip +
+    theme(panel.grid.minor.x = element_line(size = .3,
+                                            color = "#eaeaea"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_4_bars_brokenlinks.png"), width = 9, height = 6.5, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_4_bars_brokenlinks.pdf"), width = 9, height = 6.5, device = cairo_pdf)
+}
+```
+
+
+##### Effect of Large Domains
+
+```{r plot-brokenlinks-bars-large-domains, fig.width = 9, fig.height = 6.2}
+df_broken %>%
+  group_by(position, is_large) %>%
+  mutate(sum = n()) %>%
+  group_by(position, is_large, success) %>%
+  summarize(perc = n() / unique(sum)) %>%
+  mutate(perc = if_else(success == 0, -perc, perc)) %>%
+  ggplot(aes(position, perc, color = success > 0)) +
+    geom_segment(aes(xend = position, yend = 0),
+                 size = 7) +
+    #geom_point(size = 4) +
+    geom_hline(yintercept = 0,
+               color = "grey70",
+               size = 1.2) +
+    # geom_smooth(
+    #   method = "lm",
+    #   se = FALSE,
+    #   formula = y ~ x + I(x^2) + I(x^3),
+    #   color = "black"
+    # ) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       limits = c(-1, 1),
+                       breaks = c(-1, 0, 1),
+                       labels = c("100% No", "Baseline", "100% Yes")) +
+    scale_color_manual(values = c("#8800d1", bl_col), guide = F) +
+    labs(x = "POSITION", y = "HTTP RESPONSE STATUS SUCCESSFULL?",
+           title = "INTERESTINGLY, URL'S OF LARGE DOMAINS CONTAIN MORE OFTEN\nBROKEN LINKS THAN OTHER DOMAINS (19.8% VERSUS 5.5%).") +
+    theme_flip +
+    theme(panel.grid.minor.x = element_line(size = .3,
+                                            color = "#eaeaea"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_4_bars_brokenlinks_facet.png"), width = 9, height = 6.2, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_4_bars_brokenlinks_facet.pdf"), width = 9, height = 6.2, device = cairo_pdf)
+}
+```
+
+
+```{r plot-brokenlinks-bars-large-domains-detail, fig.width = 9, fig.height = 6.5}
+df_broken %>%
+  filter(large_domains != "other") %>%
+  group_by(large_domains) %>%
+  mutate(sum = n()) %>%
+  group_by(large_domains, success) %>%
+  summarize(perc = n() / unique(sum)) %>%
+  mutate(perc = if_else(success == 0, -perc, perc)) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, perc)) %>%
+  ggplot(aes(large_domains, perc, color = success > 0)) +
+    geom_segment(aes(xend = large_domains, yend = 0),
+                 size = 4.5) +
+    #geom_point(size = 4) +
+    geom_hline(yintercept = 0,
+               color = "grey70",
+               size = 1.2) +
+    coord_flip() +
+    scale_x_discrete(expand = c(.02, .02)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       limits = c(-1, 1),
+                       breaks = c(-1, -.5, 0, .5, 1),
+                       labels = c("100% No", "50% No", "Baseline", "50% Yes", "100% Yes")) +
+    scale_color_manual(values = c("#8800d1", bl_col), guide = F) +
+    labs(x = "POSITION", y = "HTTP RESPONSE STATUS SUCCESSFULL?",
+           title = "THE PATTERN OF LESSS SUCCESSFULL REQUEST OF LARGE DOMAINS,\nARISES FROM THE BAD PERFORMANCE OF SOME DOMAINS,\nNOTABLY YELLOWPAGES AND YELP BUT ALSO INSTAGRAM AND AMAZON.") +
+    theme_flip +
+    theme(panel.grid.minor.x = element_line(size = .3,
+                                            color = "#eaeaea"),
+          plot.title.position = "plot")
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_4_bars_brokenlinks_largedoms.png"), width = 9, height = 7.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_4_bars_brokenlinks_largedoms.pdf"), width = 9, height = 7.9, device = cairo_pdf)
+}
+```
+
+
+
+```{r rm-data-2-3-4}
+rm(df_broken)
+```
+
+
+
+### 2.3.5 Anchor Text (Ahrefs)
+
+#### % Exact Matches
+
+```{r plot-exactmatches-pointinterval, fig.width = 9, fig.height = 6.2}
+df_ahrefs %>%
+  dplyr::select(position, perc_exact_matches) %>%
+  ggplot(aes(position, perc_exact_matches, color = position)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +  ## might by interval_size_domain depending on package version
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(0, 0),
+                       limits = c(-0.00001, NA),
+                       breaks = seq(0, .0003, by = .00005),
+                       labels = c("0%", "0.005%", "0.01%", "0.015%", "0.02%", "0.025%", "0.03%")) +
+    scale_color_gradient2(low = "#008556",
+                        mid = bl_col,
+                        high = "#79d8b6",
+                        midpoint = 5,
+                        guide = F) +
+    labs(x = "POSITION", y = "EXACT MATCHES",
+           title = "MOST ANCHOR TEXTS DID NOT MATCH THE KEYWORD AT ALL,\nWITH TOP RANKED URL'S HAVING A BIT HIGHER SCORES.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_5_pointint_mexact.png"), width = 9, height = 6.2, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_5_pointint_mexact.pdf"), width = 9, height = 6.2, device = cairo_pdf)
+}
+```
+
+
+```{r plot-exactmatches-multiinterval, fig.width = 9, fig.height = 6.9}
+df_ahrefs %>%
+  dplyr::select(position, perc_exact_matches) %>%
+  ggplot(aes(position, perc_exact_matches, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.01, .01),
+                       breaks = seq(0, 1, by = .2),
+                       labels = scales::percent_format()) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "EXACT MATCHES",
+           title = "MORE THAN 95% OF ALL ANCHOR TEXTS DID NOT MATCH\nTHE KEYWORD AT ALL, INDEPENDENT OF POSITION.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_5_multiint_mexact.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_4_3_multiint_mexact.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+#### % Partial Matches
+
+```{r plot-partialmatches-pointinterval, fig.width = 9, fig.height = 6.2}
+df_ahrefs %>%
+  dplyr::select(position, perc_partial_matches) %>%
+  ggplot(aes(position, perc_partial_matches, color = position)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(0, .0),
+                       limits = c(-.00005, NA),
+                       breaks = seq(0, .0025, by = .0005),
+                       labels = scales::percent_format()) +
+    scale_color_gradient2(low = "#008556",
+                        mid = bl_col,
+                        high = "#79d8b6",
+                        midpoint = 5,
+                        guide = F) +
+    labs(x = "POSITION", y = "PARTIAL MATCHES",
+           title = "MORE THAN 95% OF ANCHOR TEXTS DID ALSO NOT MATCH THE\nKEYWORD PARTIALLY. AGAIN, INDEPENDENT FROM POSITION.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_5_pointint_mpartial.png"), width = 9, height = 6.2, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_5_pointint_mpartial.pdf"), width = 9, height = 6.2, device = cairo_pdf)
+}
+```
+
+
+```{r plot-partialmatches-multiinterval, fig.width = 9, fig.height = 6.9}
+df_ahrefs %>%
+  dplyr::select(position, perc_partial_matches) %>%
+  ggplot(aes(position, perc_partial_matches, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.01, .01),
+                       breaks = seq(0, 1, by = .2),
+                       labels = scales::percent_format()) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "PARTIAL MATCHES",
+           title = "INDEPENDENT FROM POSITION, MORE THAN 95% OF ALL\nANCHOR TEXTS DID NOT EVEN MATCH THE KEYWORD PARTIALLY.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_5_multiint_mpartial.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_5_multiint_mpartial.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+
+### 2.3.6 URL Rating (Ahrefs)
+
+```{r plot-urlrating-histogram, fig.width = 9, fig.height = 6.3}
+ggplot(df_ahrefs, aes(URL_rating)) +
+  geom_histogram(bins = 35, color = "#389977", fill = bl_col, size = .8) +
+  scale_x_continuous(expand = c(.01, .01),
+                     breaks = seq(0, 100, by = 20)) +
+  scale_y_continuous(expand = c(.02, .02),
+                     breaks = seq(0, 4*10^6, length.out = 5),
+                     labels = c("0", "1M", "2M", "3M", "4M")) +
+  labs(x = "URL RATING", y = "COUNT",
+       title = "URL RATINGS ARE GENERALLY LOW WITH AN AVERAGE OF 11.2.")
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_6_histogram_urlrating.png"), width = 9, height = 6.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_6_histogram_urlrating.pdf"), width = 9, height = 6.3, device = cairo_pdf)
+}
+```
+
+
+```{r plot-urlrating-pointinterval, fig.width = 9, fig.height = 6.2}
+df_ahrefs %>%
+  dplyr::select(position, URL_rating) %>%
+  ggplot(aes(position, URL_rating, color = position)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x,# + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       breaks = seq(4, 16, by = 2)) +
+    scale_color_gradient2(low = "#008556",
+                          mid = bl_col,
+                          high = "#79d8b6",
+                          midpoint = 5,
+                          guide = F) +
+    labs(x = "POSITION", y = "URL RATING",
+           title = "URL'S RANKED ON POSTION 1-6 HAVE A MEDIAN URL RATING\nOF 12. THE MEDIAN SCORE OF LOWER RANKED URL'S IS 11.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_6_pointint_urlrating_lm.png"), width = 9, height = 6.2, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_6_pointint_urlrating_lm.pdf"), width = 9, height = 6.2, device = cairo_pdf)
+}
+```
+
+
+```{r plot-urlrating-multiinterval, fig.width = 9, fig.height = 6.9}
+df_ahrefs %>%
+  dplyr::select(position, URL_rating) %>%
+  ggplot(aes(position, URL_rating, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.01, .01),
+                       breaks = seq(0, 100, by = 20)) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "URL RATING",
+           title = "URL RATINGS ARE ALMOST SIMILAR ACROSS POSITIONS\nAND ARE GENERALLY LOW IN MOST CASES (11.2 ON AVERAGE).") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_6_multiint_urlrating.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_6_multiint_urlrating.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+#### Effect of Large Domains
+
+```{r plot-urlrating-multiinterval-large-domains, fig.width = 9, fig.height = 6.9}
+df_ahrefs %>%
+  dplyr::select(position, URL_rating, is_large) %>%
+  ggplot(aes(position, URL_rating, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       breaks = seq(0, 100, by = 20)) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "URL RATING",
+           title = "LARGE DOMAINS SCORE ALSO HIGHER (14.8) THAN\nOTHER DOMAINS (10.5) WHEN IT COMES TO URL RATINGS.") +
+    theme_flip +
+    theme(legend.position = "bottom",
+          legend.margin = margin(t = 10))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_6_multiint_urlrating_facet.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_6_multiint_urlrating_facet.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+
+## linear model
+lm_ul <- summary(lm(url_length ~ position, data = df_ahrefs))
+```
+
+
+```{r plot-urlrating-multiinterval-large-domains-detail-zeros, fig.width = 9, fig.height = 7.6}
+df_large_domains <-
+  df_ahrefs %>%
+  dplyr::select(position, URL_rating, large_domains) %>%
+  filter(large_domains != "other") %>%
+  group_by(large_domains) %>%
+  mutate(m = mean(URL_rating, na.rm = T)) %>%
+  mutate(
+    is_lower = case_when(
+      URL_rating < m ~ 1,
+      URL_rating > m ~ 0,
+      URL_rating == m ~ -1
+    )
+  ) %>%
+  summarize(
+    avg = unique(m),
+    min = min(URL_rating, na.rm = T),
+    max = max(URL_rating, na.rm = T),
+    p_below = mean(position[is_lower == 1], na.rm = T),
+    p_above = mean(position[is_lower == 0], na.rm = T)
+  ) %>%
+  mutate(
+    c_low = if_else(p_below > p_above, "lower", "higher"),
+    c_high = if_else(p_below < p_above, "lower", "higher"),
+    c_low = if_else(is.na(c_low), "lower", c_low),  ## doesn't matter, just to remove from legend
+    c_high = if_else(is.na(c_high), "lower", c_high)
+  ) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, avg))
+
+df_large_domains %>%
+  ggplot(aes(avg, large_domains)) +
+    geom_segment(aes(x = avg,
+                     xend = min,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_low),
+                 size = 1.3) +
+    geom_segment(aes(x = avg,
+                     xend = max,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_high),
+                 size = 1.3) +
+    geom_point(size = 3) +
+    scale_y_discrete(expand = c(.03, .03)) +
+    scale_x_continuous(expand = c(.02, .02),
+                       breaks = seq(0, 80, by = 10)) +
+    scale_color_manual(values = c(bl_col, "#8800d1"),
+                       name = "Average Position Below/Above the Metric's Average is...") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "URL RATING", y = NULL,
+           title = "AMONG THE TOP LARGE DOMAINS WITH REGARD TO URL RATING\nARE THE SOCIAL MEDIA PLATFORMS, WIKIPEDIA & AMAZON.\nMOSTLY, A HIGHER URL RATING LEADS TO BETTER POSITIONS.") +
+    theme_flip +
+    theme(plot.title.position = "plot",
+          legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.key.width = unit(14, "lines"),
+          legend.spacing.x = unit(0.75, "pt"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_6_segments_urlrating_largedoms.png"), width = 9, height = 7.6, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_6_segments_urlrating_largedoms.pdf"), width = 9, height = 7.6, device = cairo_pdf)
+}
+
+rm(df_large_domains)
+```
+
+
+
+### 2.3.7 URL Length (Ahrefs)
+
+```{r plot-urllength-histogram, fig.width = 9, fig.height = 6.3}
+ggplot(df_ahrefs, aes(url_length)) +
+  geom_histogram(bins = 35, color = "#389977", fill = bl_col, size = .8) +
+  scale_x_continuous(expand = c(.01, .01),
+                     breaks = seq(0, 2000, by = 500),
+                     labels = c("0", "500", "1K", "1.5K", "2K")) +
+  scale_y_continuous(expand = c(.02, .02),
+                     breaks = seq(0, 10^7, length.out = 6),
+                     labels = c("0", "2M", "4M", "6M", "8M", "10M")) +
+  labs(x = "URL LENGTH (# CHARACTERS)", y = "COUNT",
+       title = "MOST URL'S ARE RATHER SHORT.")
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_7_histogram_urllength.png"), width = 9, height = 6.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_7_histogram_urllength.pdf"), width = 9, height = 6.3, device = cairo_pdf)
+}
+```
+
+```{r plot-urllength-histogram-log, fig.width = 9, fig.height = 6.3}
+ggplot(df_ahrefs, aes(url_length + 1)) +
+  geom_histogram(bins = 35, color = "#389977", fill = bl_col, size = .8) +
+  scale_x_log10(expand = c(.025, .025),
+                breaks = c(10, 25, 50, 100, 250, 500, 1000),
+                labels = c("10", "25", "50", "100", "250", "500", "1K")) +
+  scale_y_continuous(expand = c(.02, .02),
+                     breaks = seq(0, 2*10^6, length.out = 5),
+                     labels = c("0", "0.5M", "1M", "1.5M", "2M")) +
+  labs(x = "URL LENGTH (# CHARACTERS)", y = "COUNT",
+       title = "MOST URL'S ARE BETWEEN 40 AND 100 CHARACTERS LONG.")
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_7_histogram_urllength_log.png"), width = 9, height = 6.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_7_histogram_urllength_log.pdf"), width = 9, height = 6.3, device = cairo_pdf)
+}
+```
+
+
+```{r plot-urllength-pointinterval, fig.width = 9, fig.height = 6.2}
+df_ahrefs %>%
+  dplyr::select(position, url_length) %>%
+  ggplot(aes(position, url_length, color = position)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x,# + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       breaks = seq(25, 150, by = 25)) +
+    scale_color_gradient2(low = "#008556",
+                          mid = bl_col,
+                          high = "#79d8b6",
+                          midpoint = 5,
+                          guide = F) +
+    labs(x = "POSITION", y = "URL LENGTH (# CHARACTERS)",
+           title = "URL'S ON POSTION 10 ARE ON AVERAGE 9.2\n CHARACTERS LONGER THAN THOSE RANKED AS #1.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_7_pointint_urllength_lm.png"), width = 9, height = 6.2, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_7_pointint_urllength_lm.pdf"), width = 9, height = 6.2, device = cairo_pdf)
+}
+
+## linear model
+lm_ul <- summary(lm(url_length ~ position, data = df_ahrefs))
+```
+
+
+```{r plot-urllength-multiinterval, fig.width = 9, fig.height = 6.9}
+df_ahrefs %>%
+  dplyr::select(position, url_length) %>%
+  ggplot(aes(position, url_length, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       limits = c(1, NA),
+                       breaks = c(1, seq(250, 2000, by = 250))) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "URL LENGTH (# CHARACTERS)",
+           title = "MAXIMUM URL LENGTH SEEMS TO DECREASE WITH LOWER RANKING,\nBUT MOST URL'S ARE REMARKABLY SHORTER (MEAN OF 66 CHARS).") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_7_multiint_urllength.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_7_multiint_urllength.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+#### -- zoom-in
+
+```{r plot-urllength-multiinterval-zoom, fig.width = 9, fig.height = 7.2}
+df_ahrefs %>%
+  dplyr::select(position, url_length) %>%
+  ggplot(aes(position, url_length, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       breaks = seq(40, 100, by = 20)) +
+    scale_color_manual(values = int_cols[3:6],
+                       labels = int_perc[3:6],
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "URL LENGTH (# CHARACTERS)",
+           title = "URL'S AT #1 ARE ON AVERAGE 9.2 CHARACTERS SHORTER\nTHAN THOSE RANKED AT #10. HOWEVER, THE MAJORITY OF\nURL'S HAVE SIMILAR LENGTHS OF 40 TO 100 CHARACTERS.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_7_multiint_urllength_zoom.png"), width = 9, height = 7.2, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_7_multiint_urllength_zoom.pdf"), width = 9, height = 7.2, device = cairo_pdf)
+}
+```
+
+
+#### -- log scale
+
+```{r plot-urllength-multiinterval-log, fig.width = 9, fig.height = 6.9}
+df_ahrefs %>%
+  dplyr::select(position, url_length) %>%
+  ggplot(aes(position, log2(url_length + 1), group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.001, .001),
+                       limits = c(log2(10), NA),
+                       breaks = log2(c(10, 25, 50, 100, 250, 500, 1000, 2000) + 1),
+                       labels = c("10", "25", "50", "100", "250", "500", "1000", "2000")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "URL LENGTH (# CHARACTERS)",
+           title = "THE MAJORITY OF URL'S ARE BETWEEN 40 AND 100\nCHARACTERS LONG, WITH SLIGHTLY SHORTER URL'S ON THE TOP.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_7_multiint_urllength_log.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_7_multiint_urllength_log.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+#### Effect of Large Domains
+
+```{r plot-urllength-multiinterval-large-domains, fig.width = 9, fig.height = 6.9}
+df_ahrefs %>%
+  dplyr::select(position, url_length, is_large) %>%
+  ggplot(aes(position, log2(url_length), group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.01, .01),
+                       limits = c(log2(10), NA),
+                       breaks = log2(c(10, 50, 250, 1000) + 1),
+                       labels = c("10", "50", "250", "1000")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "URL LENGTH (# CHARACTERS)",
+           title = "URL'S OF LARGE DOMAINS ARE ON AVERAGE 6.4 CHARACTERS\nSHORTER THAN THE URL'S OF OTHER DOMAINS.") +
+    theme_flip +
+    theme(legend.position = "bottom",
+          legend.margin = margin(t = 10))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_7_multiint_urllength_facet.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_7_multiint_urllength_facet.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+
+## summary stats
+m <-
+  df_ahrefs %>%
+  dplyr::select(position, url_length, is_large) %>%
+  group_by(is_large) %>%
+  summarize(m = round(mean(url_length, na.rm = T), 1)) %>%
+  pull(m)
+```
+
+
+```{r plot-urllength-multiinterval-large-domains-detail, fig.width = 9, fig.height = 7.6}
+df_large_domains <-
+  df_ahrefs %>%
+  dplyr::select(position, url_length, large_domains) %>%
+  filter(large_domains != "other") %>%
+  group_by(large_domains) %>%
+  mutate(m = mean(url_length, na.rm = T)) %>%
+  mutate(
+    is_lower = case_when(
+      url_length < m ~ 1,
+      url_length > m ~ 0,
+      url_length == m ~ -1
+    )
+  ) %>%
+  summarize(
+    avg = unique(m),
+    min = min(url_length, na.rm = T),
+    max = max(url_length, na.rm = T),
+    p_below = mean(position[is_lower == 1], na.rm = T),
+    p_above = mean(position[is_lower == 0], na.rm = T)
+  ) %>%
+  mutate(
+    c_low = if_else(p_below > p_above, "lower", "higher"),
+    c_high = if_else(p_below < p_above, "lower", "higher"),
+    c_low = if_else(is.na(c_low), "lower", c_low),  ## doesn't matter, just to remove from legend
+    c_high = if_else(is.na(c_high), "lower", c_high)
+  ) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, avg))
+
+df_large_domains %>%
+  ggplot(aes(avg, large_domains)) +
+    geom_segment(aes(x = avg,
+                     xend = min,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_low),
+                 size = 1.3) +
+    geom_segment(aes(x = avg,
+                     xend = max,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_high),
+                 size = 1.3) +
+    geom_point(size = 3) +
+    scale_y_discrete(expand = c(.03, .03)) +
+    scale_x_continuous(expand = c(.01, .01),
+                       limits = c(1, NA),
+                       breaks = c(1, 100, seq(250, 1500, by = 250))) +
+    scale_color_manual(values = c(bl_col, "#8800d1"),
+                       name = "Average Position Below/Above the Metric's Average is...") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "URL LENGTH (# CHARACTERS)", y = NULL,
+           title = "TRIPADVISOR HAS THE LONGEST URL'S ON AVERAGE (109 CHARACTERS),\nFACEBOOK & EBAY THE LONGEST In TOTAL (ABOVE 1250 CHARACTERS).\nBUT NOT IN ALL CASES LONGER URL'S LEAD TO LOWER POSITIONS.") +
+    theme_flip +
+    theme(plot.title.position = "plot",
+          legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.key.width = unit(14, "lines"),
+          legend.spacing.x = unit(0.75, "pt"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_7_segments_urllength_largedoms.png"), width = 9, height = 7.6, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_7_segments_urllength_largedoms.pdf"), width = 9, height = 7.6, device = cairo_pdf)
+}
+
+rm(df_large_domains)
+```
+
+
+### 2.3.8 Word Amount in Body
+
+```{r data-2-3-8}
+df_words <- readRDS(here::here("proc_data", "sql_wordsbody.Rds"))
+```
+
+
+```{r plot-words-histogram, fig.width = 9, fig.height = 6.3}
+ggplot(df_words, aes(word_amount_body + 1)) +
+  geom_histogram(bins = 35, color = "#389977", fill = bl_col, size = .8) +
+  scale_x_log10(expand = c(.02, .02),
+                  breaks = c(0, 10^2, 10^4, 10^6) + 1,
+                  labels = c("1", "100", "10K", "1M")) +
+  scale_y_continuous(expand = c(.02, .02),
+                     breaks = seq(0, 2*10^6, length.out = 5),
+                     labels = c("0", "0.5M", "1M", "1.5M", "2M")) +
+  labs(x = "POSITION", y = "WORD AMOUNT IN BODY",
+           title = "MOST URL'S CONTAIN BETWEEN 100 AND 10,000 WORDS.")
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_8_histogram_words.png"), width = 9, height = 6.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_8_histogram_words.pdf"), width = 9, height = 6.3, device = cairo_pdf)
+}
+```
+
+```{r plot-words-pointinterval, fig.width = 9, fig.height = 6.2}
+df_words %>%
+  dplyr::select(position, word_amount_body) %>%
+  ggplot(aes(position, word_amount_body, color = position)) +
+    stat_pointinterval(size_domain = c(.5, 3)) +
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      formula = y ~ x,# + I(x^2) + I(x^3),
+      color = "black"
+    ) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.03, .03),
+                       breaks = seq(0, 6000, by = 1000)) +
+    scale_color_gradient2(low = "#008556",
+                          mid = bl_col,
+                          high = "#79d8b6",
+                          midpoint = 5,
+                          guide = F) +
+    labs(x = "POSITION", y = "WORD AMOUNT IN BODY",
+           title = "THE AMOUNT OF WORDS DOES NOT\nDIFFER AMONG POSITIONS AT ALL.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_8_pointint_words_lm.png"), width = 9, height = 5.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_8_pointint_words_lm.pdf"), width = 9, height = 5.9, device = cairo_pdf)
+}
+```
+
+
+```{r plot-words-multiinterval, fig.width = 9, fig.height = 6.9}
+df_words %>%
+  dplyr::select(position, word_amount_body) %>%
+  ggplot(aes(position, word_amount_body, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_continuous(expand = c(.02, .02),
+                       breaks = seq(0, 1.5*10^6, by = 2.5*10^5),
+                       labels = c("0", "250K", "500K", "750K", "1M", "1.25M", "1.5M")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "WORD AMOUNT IN BODY",
+           title = "MOST URL'S CONTAIN A BETWEEN 100 AND 10,000 WORDS.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_8_multiint_words.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_8_multiint_words.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+```{r plot-words-multiinterval-log, fig.width = 9, fig.height = 6.9}
+df_words %>%
+  dplyr::select(position, word_amount_body) %>%
+  ggplot(aes(position, word_amount_body + 1, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    scale_y_log10(expand = c(.02, .02),
+                  breaks = c(0, 10^2, 10^4, 10^6) + 1,
+                  labels = c("1", "100", "10K", "1M")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "WORD AMOUNT IN BODY",
+           title = "MOST URL'S CONTAIN A BETWEEN 100 AND 10.000 WORDS.") +
+    theme_flip
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_8_multiint_words_log.png"), width = 9, height = 6.9, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_8_multiint_words_log.pdf"), width = 9, height = 6.9, device = cairo_pdf)
+}
+```
+
+
+
+#### Effect of Large Domains
+
+```{r plot-words-multiinterval-large-domains, fig.width = 9, fig.height = 6.9}
+df_words %>%
+  dplyr::select(position, word_amount_body, is_large) %>%
+  ggplot(aes(position, word_amount_body + 1, group = position)) +
+    stat_interval(.width = c(.05, .25, .5, .75, .95, 1)) +
+    facet_wrap(~ is_large, nrow = 1, scales = "free_y") +
+    coord_flip() +
+    scale_x_reverse(expand = c(0, 0),
+                    breaks = 1:10,
+                    limits = c(10.5, .5)) +
+    # scale_y_continuous(expand = c(.02, .02),
+    #                    breaks = seq(0, 1.5*10^6, by = 2.5*10^5),
+    #                    labels = c("0", "250K", "500K", "750K", "1M", "1.25M", "1.5M")) +
+    scale_y_log10(expand = c(.02, .02),
+                  breaks = c(0, 10^2, 10^4, 10^6) + 1,
+                  labels = c("1", "100", "10K", "1M")) +
+    scale_color_manual(values = int_cols,
+                       labels = int_perc,
+                       name = "PERCENTAGE OF VALUES") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "POSITION", y = "WORD AMOUNT IN BODY",
+         title = "LARGE DOMAINS HAVE MAXIMA OF AROUND 10,000 WORDS\nAND REMARKABLY LOWER MEDIAN OF WORDS (224)\nCOMPARED TO OTHER DOMAINS (932).") +
+    theme_flip +
+    theme(legend.position = "bottom",
+          legend.margin = margin(t = 10),
+          panel.spacing.x = unit(2, "lines"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_8_multiint_words_facet_log.png"), width = 9, height = 7.1, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_8_multiint_words_facet_log.pdf"), width = 9, height = 7.1, device = cairo_pdf)
+}
+```
+
+
+```{r plot-words-multiinterval-large-domains-detail, fig.width = 9, fig.height = 7.3}
+df_large_domains <-
+  df_words %>%
+  dplyr::select(position, word_amount_body, large_domains) %>%
+  filter(large_domains != "other") %>%
+  group_by(large_domains) %>%
+  mutate(m = mean(word_amount_body, na.rm = T)) %>%
+  mutate(
+    is_lower = case_when(
+      word_amount_body < m ~ 1,
+      word_amount_body > m ~ 0,
+      word_amount_body == m ~ -1
+    )
+  ) %>%
+  summarize(
+    avg = unique(m),
+    min = min(word_amount_body, na.rm = T),
+    max = max(word_amount_body, na.rm = T),
+    p_below = mean(position[is_lower == 1], na.rm = T),
+    p_above = mean(position[is_lower == 0], na.rm = T)
+  ) %>%
+  mutate(
+    c_low = if_else(p_below > p_above, "lower", "higher"),
+    c_high = if_else(p_below < p_above, "lower", "higher"),
+    c_low = if_else(is.na(c_low), "lower", c_low),  ## doesn't matter, just to remove from legend
+    c_high = if_else(is.na(c_high), "lower", c_high)
+  ) %>%
+  ungroup() %>%
+  mutate(large_domains = fct_reorder(large_domains, avg))
+
+df_large_domains %>%
+  ggplot(aes(avg, large_domains)) +
+    geom_segment(aes(x = avg,
+                     xend = min,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_low),
+                 size = 1.3) +
+    geom_segment(aes(x = avg,
+                     xend = max,
+                     y = large_domains,
+                     yend = large_domains,
+                     color = c_high),
+                 size = 1.3) +
+    geom_point(size = 3) +
+    scale_y_discrete(expand = c(.03, .03)) +
+    scale_x_continuous(expand = c(.03, .03),
+                       breaks = seq(0, 60000, by = 10000),
+                       labels = glue::glue("{seq(0, 60, by = 10)}K")) +
+    scale_color_manual(values = c(bl_col, "#8800d1"),
+                       name = "Average Position Below/Above the Metric's Average is...") +
+    guides(color = guide_legend(nrow = 1,
+                                title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom",
+                                reverse = T)) +
+    labs(x = "WORD AMOUNT IN BODY", y = NULL,
+           title = "WORD COUNTS DIFFER SLIGHTLY AMONG LARGE DOMAINS.\nON AVERAGE, TRIPADVISOR CONTAINS THE MOST WORDS\nAND PINTEREST THE FEWEST. EBAY CONTAINS THE MOST OVERALL.") +
+    theme_flip +
+    theme(plot.title.position = "plot",
+          legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.key.width = unit(14, "lines"),
+          legend.spacing.x = unit(0.75, "pt"))
+
+if(save == T){
+  ggsave(here::here("plots", "2_3_8_segments_words_largedoms.png"), width = 9, height = 7.3, dpi = dpi)
+  ggsave(here::here("plots", "pdf", "2_3_8_segments_words_largedoms.pdf"), width = 9, height = 7.3, device = cairo_pdf)
+}
+
+rm(df_large_domains)
+```
+
+
+```{r rm-data-2--8}
+rm(df_words)
+```
+
+
+***
+
+```{r session-info}
+sessionInfo()
+```
